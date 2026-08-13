@@ -1,0 +1,18 @@
+:root {
+  font-family: Inter, Pretendard, "Noto Sans KR", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #12233f;
+  background: #f5f7fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+* { box-sizing: border-box; }
+html { font-size: 16px; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input, textarea, select { font: inherit; }
+a { color: inherit; }
+*:focus-visible { outline: 3px solid rgba(54, 111, 255, .38); outline-offset: 2px; }
+.admin-scroll { scrollbar-width: thin; scrollbar-color: rgba(159, 182, 216, .7) transparent; }
+.admin-scroll::-webkit-scrollbar { width: 8px; }
+.admin-scroll::-webkit-scrollbar-track { background: transparent; margin-block: 10px; }
+.admin-scroll::-webkit-scrollbar-thumb { background: rgba(159, 182, 216, .55); border: 2px solid #0b203a; border-radius: 999px; }
+.admin-scroll::-webkit-scrollbar-thumb:hover { background: rgba(197, 214, 239, .78); }

@@ -1,0 +1,54 @@
+name: Offline image release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+      - name: Build offline runtime image
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          docker build \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "COMMIT=${GITHUB_SHA}" \
+            --build-arg "BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag "kkiit:v${VERSION}" .
+      - name: Export image archive
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: docker save "kkiit:v${VERSION}" | gzip -9 > "kkiit-v${VERSION}.tar.gz"
+      - name: Verify archive
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          gzip -t "kkiit-v${VERSION}.tar.gz"
+          docker image rm "kkiit:v${VERSION}"
+          gzip -dc "kkiit-v${VERSION}.tar.gz" | docker load
+          docker image inspect "kkiit:v${VERSION}" >/dev/null
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          gh release create "v${VERSION}" \
+            "kkiit-v${VERSION}.tar.gz" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --generate-notes \
+            --title "Kkiit v${VERSION}"

@@ -1,0 +1,320 @@
+openapi: 3.1.0
+info:
+  title: Kkiit Marketplace API
+  version: 0.1.0
+  description: Kkiit 재능·AI 서비스 마켓플레이스 REST API
+servers:
+  - url: /api/v1
+security:
+  - cookieSession: []
+  - bearerApiKey: []
+paths:
+  /version:
+    get:
+      security: []
+      summary: 서비스 빌드 버전
+      responses:
+        '200': { description: version information }
+  /auth/providers:
+    get:
+      security: []
+      summary: 활성 로그인 제공자
+      responses:
+        '200': { description: enabled providers }
+  /auth/login:
+    post:
+      security: []
+      summary: 로컬 로그인
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        '200': { description: login success }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/register:
+    post:
+      security: []
+      summary: 공개 가입 정책에 따른 로컬 계정 가입
+      responses:
+        '201': { description: registered and signed in }
+  /me/seller-profile:
+    get:
+      summary: 내 판매자 프로필
+      responses:
+        '200': { description: seller profile or disabled state }
+    put:
+      summary: 판매자 프로필 활성화 또는 변경
+      responses:
+        '200': { description: seller profile enabled }
+  /me:
+    get:
+      summary: 현재 사용자와 유효 권한
+      responses:
+        '200': { description: principal }
+    patch:
+      summary: 개인 프로필 변경
+      responses:
+        '200': { description: updated }
+  /me/api-keys:
+    get:
+      summary: 개인 API Key 목록
+      responses:
+        '200': { description: keys without secrets }
+    post:
+      summary: 개인 API Key 발급
+      description: Secret 원문은 이 응답에서 한 번만 반환된다.
+      responses:
+        '201': { description: created key with one-time secret }
+  /me/api-keys/{id}/rotate:
+    post:
+      summary: API Key 원자적 회전
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '201': { description: rotated key with one-time secret }
+  /me/mfa:
+    get:
+      summary: 내 TOTP MFA 상태
+      responses:
+        '200': { description: MFA status }
+  /me/mfa/totp/setup:
+    post:
+      summary: 일회 표시 비밀값과 otpauth URI 발급
+      responses:
+        '201': { description: pending TOTP setup }
+  /me/mfa/totp/confirm:
+    post:
+      summary: 6자리 코드 검증 후 TOTP 활성화
+      responses:
+        '200': { description: TOTP enabled }
+  /me/mfa/totp:
+    delete:
+      summary: 현재 코드 검증 후 TOTP 해제
+      responses:
+        '204': { description: TOTP disabled }
+  /talents:
+    get:
+      security: []
+      summary: 공개 재능 상품 FTS 검색
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100 } }
+      responses:
+        '200': { description: talents }
+    post:
+      summary: 재능 상품과 패키지, Smart Order Form 등록
+      responses:
+        '201': { description: draft talent }
+  /talents/{id}:
+    get:
+      security: []
+      summary: 재능 상세
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: talent detail }
+    put:
+      summary: 본인 재능 상품 변경
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: updated }
+  /talents/{id}/publish:
+    post:
+      summary: 재능 공개 또는 승인 요청
+      description: 조건과 일치하는 활성 talent_publish 정책이 없으면 즉시 공개한다.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: published or review_pending }
+  /orders:
+    get:
+      summary: 접근 가능한 구매·판매 주문
+      responses:
+        '200': { description: orders }
+    post:
+      summary: 공개 상품 주문
+      responses:
+        '201': { description: created order }
+  /orders/{id}:
+    get:
+      summary: 주문 Workspace 데이터와 Timeline
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: order workspace }
+  /orders/{id}/transition:
+    post:
+      summary: 허용표 기반 주문 상태 변경
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: transitioned }
+        '409': { $ref: '#/components/responses/Error' }
+  /orders/{id}/pay:
+    post:
+      summary: 결제 Adapter 실행과 에스크로 원장 기록
+      description: Idempotency-Key 헤더가 필수이며 현재 기본 Adapter는 관리자 정책에 따른 manual 방식이다.
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string } }
+      responses:
+        '200': { description: payment recorded idempotently }
+  /orders/{id}/deliveries:
+    post:
+      summary: 판매자 납품 등록
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '201': { description: delivery }
+  /orders/{id}/revision:
+    post:
+      summary: 구매자 수정 요청
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '201': { description: revision }
+  /orders/{id}/accept:
+    post:
+      summary: 구매확정 및 정산 원장 생성
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: accepted and settlement scheduled }
+  /orders/{id}/messages:
+    get:
+      summary: 주문 메시지와 읽음 상태 조회
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: messages }
+    post:
+      summary: 주문 메시지 전송
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '201': { description: message created }
+  /orders/{id}/messages/ws:
+    get:
+      summary: 주문 실시간 메시지 WebSocket
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '101': { description: WebSocket upgraded }
+  /orders/{id}/files:
+    post:
+      summary: 주문 파일 업로드와 SHA-256 무결성 기록
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '201': { description: file metadata and download URL }
+  /orders/{id}/review:
+    post:
+      summary: 완료 주문 다면 리뷰 등록
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '201': { description: review created }
+  /ai/talents/draft:
+    post:
+      summary: AI 또는 오프라인 규칙 기반 재능 상품 초안
+      responses:
+        '200': { description: structured talent draft and execution mode }
+  /ai/requirements/analyze:
+    post:
+      summary: AI 또는 오프라인 규칙 기반 요구사항 구조화
+      responses:
+        '200': { description: requirement analysis and completeness score }
+  /recommendations:
+    get:
+      security: []
+      summary: 요구사항과 예산 기반 상품 추천
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: budget_max, in: query, schema: { type: integer, minimum: 0 } }
+      responses:
+        '200': { description: ranked talents with explanations }
+  /rfqs:
+    get:
+      summary: 접근 가능한 견적 프로젝트
+      responses:
+        '200': { description: RFQs }
+    post:
+      summary: Smart RFQ 등록
+      responses:
+        '201': { description: RFQ created }
+  /rfqs/{id}/quotes:
+    get:
+      summary: RFQ 견적 비교
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: quotes ranked by match, price and delivery }
+  /quotes:
+    post:
+      summary: 판매자 견적 제출
+      responses:
+        '201': { description: quote submitted }
+  /admin/dashboard:
+    get:
+      summary: 운영 KPI와 예외 수
+      responses:
+        '200': { description: operations dashboard }
+  /admin/talents:
+    get:
+      summary: 전체 상태의 상품 운영 목록
+      responses:
+        '200': { description: all talents }
+  /admin/orders:
+    get:
+      summary: 전체 주문 운영 목록
+      responses:
+        '200': { description: all orders }
+  /admin/risk:
+    get:
+      summary: 위험·분쟁·정산 보류 예외 대기열
+      responses:
+        '200': { description: risk queue }
+  /admin/settings:
+    get:
+      summary: 중앙 운영 설정 목록
+      responses:
+        '200': { description: settings with redacted secrets }
+  /admin/settings/{key}:
+    put:
+      summary: 운영 설정 낙관적 버전 변경
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: setting updated }
+        '409': { $ref: '#/components/responses/Error' }
+  /admin/auth-providers:
+    get:
+      summary: 로그인 제공자 설정 목록
+      responses:
+        '200': { description: providers with redacted secrets }
+    post:
+      summary: Google, Naver, Apple, Kakao, Keycloak 또는 custom 제공자 추가
+      responses:
+        '201': { description: provider created }
+  /admin/approvals/requests:
+    get:
+      summary: 승인 대기열
+      responses:
+        '200': { description: approval requests }
+  /admin/audit:
+    get:
+      summary: 불변 관리자 감사로그
+      responses:
+        '200': { description: audit events }
+components:
+  securitySchemes:
+    cookieSession: { type: apiKey, in: cookie, name: kkiit_session }
+    bearerApiKey: { type: http, scheme: bearer }
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Error:
+      description: API error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  code: { type: string }
+                  message: { type: string }

@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -45,19 +47,84 @@ func (s *Server) listApprovalPolicies(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateApprovalPolicy(in *approvalPolicyInput) bool {
+	in.ResourceType = strings.TrimSpace(in.ResourceType)
+	in.Name = strings.TrimSpace(in.Name)
 	if in.ResourceType == "" || in.Name == "" {
 		return false
 	}
 	if in.Priority == 0 {
 		in.Priority = 100
 	}
+	if in.Priority < 1 {
+		return false
+	}
 	if in.Conditions == nil {
 		in.Conditions = map[string]any{}
+	}
+	for _, key := range []string{"min_amount", "max_amount", "quality_score_below"} {
+		if raw, exists := in.Conditions[key]; exists {
+			value, ok := numericValue(raw)
+			if !ok || value < 0 || math.IsInf(value, 0) || math.IsNaN(value) {
+				return false
+			}
+		}
+	}
+	minimum, hasMinimum := numericValue(in.Conditions["min_amount"])
+	maximum, hasMaximum := numericValue(in.Conditions["max_amount"])
+	if hasMinimum && hasMaximum && minimum > maximum {
+		return false
 	}
 	if len(in.Steps) == 0 {
 		in.Steps = []map[string]any{{"role": "operator", "min_approvals": 1}}
 	}
+	for _, step := range in.Steps {
+		role, roleOK := step["role"].(string)
+		approvals, approvalsOK := numericValue(step["min_approvals"])
+		if !roleOK || strings.TrimSpace(role) == "" || !approvalsOK || approvals < 1 || approvals != math.Trunc(approvals) {
+			return false
+		}
+	}
 	return true
+}
+
+func numericValue(value any) (float64, bool) {
+	switch number := value.(type) {
+	case int:
+		return float64(number), true
+	case int64:
+		return float64(number), true
+	case float64:
+		return number, true
+	default:
+		return 0, false
+	}
+}
+
+func (s *Server) deleteApprovalPolicy(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDPath(w, r, "id")
+	if !ok {
+		return
+	}
+	var requestCount int
+	if err := s.DB.QueryRow(r.Context(), `SELECT count(*) FROM approval_requests WHERE policy_id=$1`, id).Scan(&requestCount); err != nil {
+		writeError(w, 500, "query_failed", "승인 정책의 사용 내역을 확인하지 못했습니다.")
+		return
+	}
+	if requestCount > 0 {
+		writeError(w, 409, "policy_in_use", "처리 이력이 있는 정책은 삭제할 수 없습니다. 비활성화해 주세요.")
+		return
+	}
+	tag, err := s.DB.Exec(r.Context(), `DELETE FROM approval_policies WHERE id=$1`, id)
+	if err != nil {
+		writeError(w, 500, "delete_failed", "승인 정책을 삭제하지 못했습니다.")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeError(w, 404, "not_found", "승인 정책을 찾을 수 없습니다.")
+		return
+	}
+	s.audit(r, "approval_policy.delete", "approval_policy", id.String(), nil, nil, "success")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) createApprovalPolicy(w http.ResponseWriter, r *http.Request) {

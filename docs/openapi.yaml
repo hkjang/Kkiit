@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Kkiit Marketplace API
-  version: 0.1.0
+  version: 0.1.1
   description: Kkiit 재능·AI 서비스 마켓플레이스 REST API
 servers:
   - url: /api/v1
@@ -289,6 +289,39 @@ paths:
       summary: Google, Naver, Apple, Kakao, Keycloak 또는 custom 제공자 추가
       responses:
         '201': { description: provider created }
+  /admin/auth-providers/{id}:
+    put:
+      summary: 로그인 제공자 설정 및 활성 상태 변경
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: provider updated }
+    delete:
+      summary: 연결 계정이 없는 로그인 제공자 삭제
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: provider deleted }
+        '409': { $ref: '#/components/responses/Error' }
+  /admin/approvals/policies:
+    get:
+      summary: 승인 정책 목록
+      responses:
+        '200': { description: approval policies }
+    post:
+      summary: 승인 정책 추가
+      responses:
+        '201': { description: approval policy created }
+  /admin/approvals/policies/{id}:
+    put:
+      summary: 승인 정책과 적용 조건 변경
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: approval policy updated }
+    delete:
+      summary: 처리 이력이 없는 승인 정책 삭제
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: approval policy deleted }
+        '409': { $ref: '#/components/responses/Error' }
   /admin/approvals/requests:
     get:
       summary: 승인 대기열

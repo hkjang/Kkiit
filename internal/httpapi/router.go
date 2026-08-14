@@ -77,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/approvals/policies", s.require("approvals.manage", s.listApprovalPolicies))
 	mux.HandleFunc("POST /api/v1/admin/approvals/policies", s.require("approvals.manage", s.createApprovalPolicy))
 	mux.HandleFunc("PUT /api/v1/admin/approvals/policies/{id}", s.require("approvals.manage", s.updateApprovalPolicy))
+	mux.HandleFunc("DELETE /api/v1/admin/approvals/policies/{id}", s.require("approvals.manage", s.deleteApprovalPolicy))
 	mux.HandleFunc("GET /api/v1/admin/approvals/requests", s.require("approvals.manage", s.listApprovalRequests))
 	mux.HandleFunc("POST /api/v1/admin/approvals/requests/{id}/decision", s.require("approvals.manage", s.decideApproval))
 	mux.HandleFunc("GET /api/v1/admin/audit", s.require("audit.read", s.listAuditLogs))

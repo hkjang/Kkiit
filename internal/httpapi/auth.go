@@ -271,6 +271,15 @@ func (s *Server) oauthStart(w http.ResponseWriter, r *http.Request) {
 func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	code := r.URL.Query().Get("code")
+	if providerError := strings.TrimSpace(r.URL.Query().Get("error")); providerError != "" {
+		description := strings.TrimSpace(r.URL.Query().Get("error_description"))
+		if description == "" {
+			description = "인증 제공자가 로그인 요청을 거절했습니다."
+		}
+		s.Logger.Warn("oauth provider returned an error", "error", providerError, "description", description)
+		writeError(w, http.StatusUnauthorized, "oauth_provider_error", description)
+		return
+	}
 	if state == "" || code == "" {
 		writeError(w, 400, "invalid_oauth_callback", "인증 응답이 올바르지 않습니다.")
 		return
@@ -392,14 +401,73 @@ func (s *Server) oauthConfig(ctx context.Context, r *http.Request, p authProvide
 func (s *Server) oauthRedirectURL(r *http.Request, slug string) string {
 	if settings, err := s.settingObject(r, "auth.oauth"); err == nil {
 		if base, ok := settings["callback_base_url"].(string); ok && strings.TrimSpace(base) != "" {
-			return strings.TrimRight(base, "/") + "/api/v1/auth/oauth/" + url.PathEscape(slug) + "/callback"
+			if normalized, ok := normalizeExternalBaseURL(base); ok {
+				return oauthCallbackURL(normalized, slug)
+			}
 		}
 	}
+	return oauthCallbackURL(externalRequestBaseURL(r), slug)
+}
+
+func oauthCallbackURL(base, slug string) string {
+	return strings.TrimRight(base, "/") + "/api/v1/auth/oauth/" + url.PathEscape(slug) + "/callback"
+}
+
+func externalRequestBaseURL(r *http.Request) string {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	return scheme + "://" + r.Host + "/api/v1/auth/oauth/" + url.PathEscape(slug) + "/callback"
+	host := r.Host
+
+	// Reverse proxies normally terminate TLS before forwarding to Kkiit. Use
+	// their public scheme and host so Keycloak receives the same redirect_uri
+	// that the administrator registered. The first value is the client-facing
+	// hop when multiple proxies append values.
+	if forwarded := firstHeaderValue(r.Header.Get("Forwarded")); forwarded != "" {
+		for _, part := range strings.Split(forwarded, ";") {
+			name, value, found := strings.Cut(strings.TrimSpace(part), "=")
+			if !found {
+				continue
+			}
+			value = strings.Trim(strings.TrimSpace(value), `"`)
+			switch strings.ToLower(name) {
+			case "proto":
+				if value == "http" || value == "https" {
+					scheme = value
+				}
+			case "host":
+				if value != "" {
+					host = value
+				}
+			}
+		}
+	}
+	if value := strings.ToLower(firstHeaderValue(r.Header.Get("X-Forwarded-Proto"))); value == "http" || value == "https" {
+		scheme = value
+	}
+	if value := firstHeaderValue(r.Header.Get("X-Forwarded-Host")); value != "" {
+		host = value
+	}
+	if normalized, ok := normalizeExternalBaseURL(scheme + "://" + host); ok {
+		return normalized
+	}
+	return "http://localhost"
+}
+
+func firstHeaderValue(value string) string {
+	first, _, _ := strings.Cut(value, ",")
+	return strings.TrimSpace(first)
+}
+
+func normalizeExternalBaseURL(value string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = ""
+	return strings.TrimRight(parsed.String(), "/"), true
 }
 
 func fetchClaims(ctx context.Context, p authProvider, discovered *oidc.Provider, config *oauth2.Config, token *oauth2.Token) (map[string]any, error) {

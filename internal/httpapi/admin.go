@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
@@ -43,6 +44,28 @@ func (s *Server) putSetting(w http.ResponseWriter, r *http.Request) {
 	}
 	if !decodeJSON(w, r, &input) {
 		return
+	}
+	if key == "auth.oauth" {
+		value, ok := input.Value.(map[string]any)
+		if !ok {
+			writeError(w, 400, "invalid_value", "OAuth 설정 값을 확인해 주세요.")
+			return
+		}
+		if base, exists := value["callback_base_url"]; exists {
+			text, ok := base.(string)
+			if !ok {
+				writeError(w, 400, "invalid_callback_base_url", "외부 서비스 주소는 URL 문자열이어야 합니다.")
+				return
+			}
+			if strings.TrimSpace(text) != "" {
+				normalized, valid := normalizeExternalBaseURL(text)
+				if !valid {
+					writeError(w, 400, "invalid_callback_base_url", "외부 서비스 주소는 http:// 또는 https://로 시작하는 올바른 URL이어야 합니다.")
+					return
+				}
+				value["callback_base_url"] = normalized
+			}
+		}
 	}
 	valueJSON, err := json.Marshal(input.Value)
 	if err != nil {
@@ -154,14 +177,24 @@ func validateProvider(in *providerInput) bool {
 	in.Slug = strings.ToLower(strings.TrimSpace(in.Slug))
 	in.Name = strings.TrimSpace(in.Name)
 	in.ClientID = strings.TrimSpace(in.ClientID)
-	if in.Slug == "" || in.Name == "" || in.ClientID == "" {
+	in.IssuerURL = strings.TrimRight(strings.TrimSpace(in.IssuerURL), "/")
+	in.AuthorizationURL = strings.TrimSpace(in.AuthorizationURL)
+	in.TokenURL = strings.TrimSpace(in.TokenURL)
+	in.UserinfoURL = strings.TrimSpace(in.UserinfoURL)
+	if !providerSlugPattern.MatchString(in.Slug) || in.Name == "" || in.ClientID == "" {
 		return false
 	}
 	if in.ProviderType == "oidc" {
-		return strings.HasPrefix(in.IssuerURL, "http://") || strings.HasPrefix(in.IssuerURL, "https://")
+		_, valid := normalizeExternalBaseURL(in.IssuerURL)
+		return valid
 	}
-	return (strings.HasPrefix(in.AuthorizationURL, "http://") || strings.HasPrefix(in.AuthorizationURL, "https://")) && (strings.HasPrefix(in.TokenURL, "http://") || strings.HasPrefix(in.TokenURL, "https://"))
+	_, authorizationValid := normalizeExternalBaseURL(in.AuthorizationURL)
+	_, tokenValid := normalizeExternalBaseURL(in.TokenURL)
+	_, userinfoValid := normalizeExternalBaseURL(in.UserinfoURL)
+	return authorizationValid && tokenValid && userinfoValid
 }
+
+var providerSlugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,49}$`)
 
 func (s *Server) listAuthProviders(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.DB.Query(r.Context(), `SELECT id,slug,provider_type,preset,name,enabled,issuer_url,authorization_url,token_url,userinfo_url,client_id,(client_secret_encrypted IS NOT NULL),scopes,claim_mapping,options,created_at,updated_at FROM auth_providers ORDER BY name`)
@@ -259,6 +292,15 @@ func (s *Server) updateAuthProvider(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteAuthProvider(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseUUIDPath(w, r, "id")
 	if !ok {
+		return
+	}
+	var identityCount int
+	if err := s.DB.QueryRow(r.Context(), `SELECT count(*) FROM external_identities WHERE provider_id=$1`, id).Scan(&identityCount); err != nil {
+		writeError(w, 500, "query_failed", "연결된 계정을 확인하지 못했습니다.")
+		return
+	}
+	if identityCount > 0 {
+		writeError(w, 409, "provider_in_use", "연결된 계정이 있어 삭제할 수 없습니다. 먼저 비활성화해 주세요.")
 		return
 	}
 	tag, err := s.DB.Exec(r.Context(), `DELETE FROM auth_providers WHERE id=$1`, id)

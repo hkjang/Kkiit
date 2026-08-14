@@ -68,19 +68,21 @@ make check
 
 산출 규칙:
 
-- 이미지: `kkiit:v0.1.0`
-- 파일: `release/kkiit-v0.1.0.tar.gz`
+- 이미지: `kkiit:v0.1.1`
+- 파일: `release/kkiit-v0.1.1.tar.gz`
 
 단절망으로 파일을 반입한 뒤 다음처럼 설치합니다. 조직의 반입 절차에서 생성한 checksum이 있다면 먼저 검증합니다.
 
 ```bash
-./scripts/load-offline.sh kkiit-v0.1.0.tar.gz
+./scripts/load-offline.sh kkiit-v0.1.1.tar.gz
 docker compose up -d
 ```
 
 런타임 이미지는 애플리케이션 바이너리, React 정적 파일, CA 인증서와 시간대 데이터만 포함합니다. 외부 CDN, 폰트, JavaScript, 빌드 도구를 호출하지 않습니다. PostgreSQL은 운영 조직이 제공하는 외부 인스턴스를 사용하며 `pgvector`가 없는 환경에서도 핵심 기능이 동작합니다.
 
 완전 단절망에서는 로컬 로그인을 사용합니다. Google·Naver·Apple·Kakao는 해당 도메인에 접근 가능한 제한망에서만 사용할 수 있고, 내부 Keycloak은 Issuer URL과 Client 정보를 관리자 페이지에서 설정하면 됩니다.
+
+Keycloak 앞에서 `Invalid parameter: redirect_uri` 오류가 발생하면 관리자 `인증 연동`에서 브라우저가 접속하는 **외부 서비스 주소**(예: `https://market.example.com`)를 저장합니다. 각 제공자 카드에 표시되는 전체 콜백 주소를 Keycloak Client의 **Valid redirect URIs**에 그대로 등록해야 합니다. Kkiit는 설정값을 우선 사용하고, 비어 있으면 표준 `Forwarded` 또는 `X-Forwarded-Proto`/`X-Forwarded-Host` 헤더를 반영합니다.
 
 ## GitHub Release
 

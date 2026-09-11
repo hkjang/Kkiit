@@ -14,6 +14,7 @@ import (
 	"github.com/hkjang/Kkiit/internal/cryptox"
 	"github.com/hkjang/Kkiit/internal/database"
 	"github.com/hkjang/Kkiit/internal/httpapi"
+	"github.com/hkjang/Kkiit/internal/worker"
 )
 
 var (
@@ -51,6 +52,17 @@ func main() {
 		os.Exit(1)
 	}
 	api := &httpapi.Server{DB: pool, Box: box, Version: version, Commit: commit, BuiltAt: builtAt, Logger: logger}
+	dispatcher := &worker.Worker{DB: pool, Box: box, Logger: logger, Publish: api.PublishUser}
+	api.Rescan = dispatcher.ScanNow
+	dispatcher.Maintenance = api.RunOrderMaintenance
+	// The dispatcher claims events inside a transaction. Exiting without waiting
+	// for it leaves that work to the stuck-event sweeper on the next start,
+	// which recovers it but only after a delay nobody asked for.
+	dispatcherDone := make(chan struct{})
+	go func() {
+		defer close(dispatcherDone)
+		dispatcher.Run(ctx)
+	}()
 	server := &http.Server{Addr: ":8080", Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20}
 	go func() {
 		logger.Info("Kkiit started", "address", server.Addr, "version", version)
@@ -60,9 +72,24 @@ func main() {
 		}
 	}()
 	<-ctx.Done()
+	// Readiness fails first and the socket stays open for a moment, so whatever
+	// routes traffic here can take this instance out before it disappears. Going
+	// straight to Shutdown means every request already on its way to this
+	// process fails, which during a rolling deploy is every request.
+	api.BeginDrain()
+	logger.Info("draining before shutdown", "seconds", cfg.DrainSeconds)
+	if cfg.DrainSeconds > 0 {
+		time.Sleep(time.Duration(cfg.DrainSeconds) * time.Second)
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 	}
+	select {
+	case <-dispatcherDone:
+	case <-time.After(15 * time.Second):
+		logger.Warn("event dispatcher did not stop in time")
+	}
+	logger.Info("Kkiit stopped")
 }

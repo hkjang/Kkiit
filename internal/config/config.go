@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -16,6 +17,11 @@ type Config struct {
 	BootstrapAdmin         string
 	BootstrapAdminPassword string
 	EncryptionKey          []byte
+	// DrainSeconds is how long readiness reports failure before the listener
+	// closes, giving whatever routes traffic here time to take this instance out
+	// of rotation. Zero shuts down immediately, which is what a single instance
+	// or a test wants.
+	DrainSeconds int
 }
 
 func Load() (Config, error) {
@@ -28,6 +34,7 @@ func Load() (Config, error) {
 		BootstrapAdmin:         strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN")),
 		BootstrapAdminPassword: os.Getenv("BOOTSTRAP_ADMIN_PASSWORD"),
 		EncryptionKey:          key,
+		DrainSeconds:           intFromEnv("SHUTDOWN_DRAIN_SECONDS", 5, 0, 120),
 	}
 	if cfg.PostgresDSN == "" || cfg.BootstrapAdmin == "" || cfg.BootstrapAdminPassword == "" {
 		return Config{}, errors.New("POSTGRES_DSN, BOOTSTRAP_ADMIN, BOOTSTRAP_ADMIN_PASSWORD and ENCRYPTION_KEY are required")
@@ -50,4 +57,15 @@ func parseEncryptionKey(raw string) ([]byte, error) {
 		return decoded, nil
 	}
 	return nil, fmt.Errorf("ENCRYPTION_KEY must be exactly 32 bytes encoded as base64 or 64 hexadecimal characters")
+}
+
+// intFromEnv keeps a bad value from becoming a startup failure: a deployment
+// with a typo in an optional tuning knob should run with the default, not
+// refuse to start.
+func intFromEnv(name string, fallback, min, max int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || value < min || value > max {
+		return fallback
+	}
+	return value
 }

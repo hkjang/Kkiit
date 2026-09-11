@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -66,6 +67,22 @@ func (s *Server) validateKeyInput(r *http.Request, p Principal, in *apiKeyInput)
 	if len(in.Scopes) == 0 && allowed["mcp.use"] {
 		in.Scopes = []string{"mcp.use"}
 	}
+	if in.Scopes == nil {
+		in.Scopes = []string{}
+	}
+	// Both columns are NOT NULL with a default, so leaving the field out of the
+	// JSON used to send SQL NULL and fail at the insert. An address allowlist
+	// nobody supplied means "no restriction", not a malformed request.
+	if in.AllowedCIDRs == nil {
+		in.AllowedCIDRs = []string{}
+	}
+	// Checking the syntax here keeps a bad address a client error, so that a
+	// failure at the insert can be reported as what it is.
+	for _, entry := range in.AllowedCIDRs {
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(entry)); err != nil {
+			return false
+		}
+	}
 	return true
 }
 
@@ -99,7 +116,7 @@ func (s *Server) createMyAPIKey(w http.ResponseWriter, r *http.Request) {
 	id := uuid.New()
 	_, err = s.DB.Exec(r.Context(), `INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,scopes,allowed_cidrs,rate_limit_per_minute,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7::cidr[],$8,$9)`, id, p.UserID, in.Name, prefix, cryptox.Digest(token), in.Scopes, in.AllowedCIDRs, in.RateLimit, nullableTime(in.ExpiresAt))
 	if err != nil {
-		writeError(w, 400, "invalid_key_policy", "API 키 정책을 저장하지 못했습니다.")
+		writeError(w, 500, "key_save_failed", "API 키를 저장하지 못했습니다.")
 		return
 	}
 	s.audit(r, "api_key.create", "api_key", id.String(), nil, map[string]any{"name": in.Name, "scopes": in.Scopes}, "success")
@@ -160,4 +177,68 @@ func (s *Server) revokeMyAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "api_key.revoke", "api_key", id.String(), nil, nil, "success")
 	w.WriteHeader(204)
+}
+
+// listUserAPIKeys and revokeUserAPIKey are what keys.manage.any was always
+// meant to be. The permission existed, was granted to the security admin role
+// and appeared on the roles screen, and nothing in the codebase ever read it:
+// a security administrator was told they could manage other people's keys and
+// could not. Revoking someone else's key is ordinary incident response — a
+// leaked key on an account whose owner has left, or is asleep.
+func (s *Server) listUserAPIKeys(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDPath(w, r, "id")
+	if !ok {
+		return
+	}
+	rows, err := s.DB.Query(r.Context(), `SELECT id,name,prefix,scopes,allowed_cidrs::text[],rate_limit_per_minute,expires_at,last_used_at,revoked_at,created_at
+		FROM api_keys WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, id, queryLimit(r, 50, 200))
+	if err != nil {
+		writeError(w, 500, "query_failed", "API 키를 조회하지 못했습니다.")
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0)
+	for rows.Next() {
+		var keyID uuid.UUID
+		var name, prefix string
+		var scopes, cidrs []string
+		var rate int
+		var expires, lastUsed, revoked *time.Time
+		var created time.Time
+		if rows.Scan(&keyID, &name, &prefix, &scopes, &cidrs, &rate, &expires, &lastUsed, &revoked, &created) == nil {
+			// The secret is only ever shown once, at creation, and is stored as
+			// a hash. There is nothing here for an administrator to read and
+			// then use as the key's owner.
+			items = append(items, map[string]any{"id": keyID, "name": name, "prefix": prefix, "scopes": scopes,
+				"allowed_cidrs": cidrs, "rate_limit_per_minute": rate, "expires_at": expires,
+				"last_used_at": lastUsed, "revoked_at": revoked, "created_at": created})
+		}
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func (s *Server) revokeUserAPIKey(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDPath(w, r, "id")
+	if !ok {
+		return
+	}
+	var owner uuid.UUID
+	var name string
+	tag, err := s.DB.Query(r.Context(), `UPDATE api_keys SET revoked_at=now() WHERE id=$1 AND revoked_at IS NULL RETURNING user_id,name`, id)
+	if err != nil {
+		writeError(w, 500, "revoke_failed", "API 키를 폐기하지 못했습니다.")
+		return
+	}
+	found := tag.Next() && tag.Scan(&owner, &name) == nil
+	tag.Close()
+	if !found {
+		writeError(w, 404, "api_key_not_found", "이미 폐기되었거나 존재하지 않는 키입니다.")
+		return
+	}
+	// The owner's integration stops working the moment this returns. Without a
+	// notice they debug a dead integration with no idea it was switched off on
+	// purpose.
+	s.notifyAccountChange(r, owner, "APIKeyRevoked", map[string]any{"key_name": name})
+	s.audit(r, "api_key.revoke_any", "api_key", id.String(), nil, map[string]any{"owner": owner, "name": name}, "success")
+	w.WriteHeader(http.StatusNoContent)
 }

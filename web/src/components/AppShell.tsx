@@ -10,11 +10,12 @@ import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined'
 import LogoutRoundedIcon from '@mui/icons-material/LogoutRounded'
 import LoginRoundedIcon from '@mui/icons-material/LoginRounded'
 import { Brand } from './Brand'
+import { NotificationBell } from './NotificationBell'
 import { api } from '../api'
 import { useApp } from '../App'
 
 export function AppShell() {
-  const { me, version, refreshMe, notify } = useApp()
+  const { me, version, ready, refreshMe, notify } = useApp()
   const [anchor, setAnchor] = useState<HTMLElement | null>(null)
   const navigate = useNavigate()
   const logout = async () => {
@@ -29,6 +30,7 @@ export function AppShell() {
         {me && <Button component={RouterLink} to="/orders" color="inherit" startIcon={<ReceiptLongRoundedIcon />} sx={{ display: { xs: 'none', sm: 'inline-flex' } }}>내 주문</Button>}
         <Box sx={{ flex: 1 }} />
         {me ? <>
+          <NotificationBell />
           {me.permissions.includes('admin.access') && <Tooltip title="서비스 관리자"><IconButton component={RouterLink} to="/admin" color="primary" aria-label="서비스 관리자 열기"><AdminPanelSettingsRoundedIcon /></IconButton></Tooltip>}
           <Button color="inherit" onClick={(event) => setAnchor(event.currentTarget)} aria-controls={anchor ? 'profile-menu' : undefined} aria-haspopup="true" aria-expanded={anchor ? 'true' : undefined} sx={{ ml: 1, px: 1 }}>
             <Avatar sx={{ width: 36, height: 36, bgcolor: 'secondary.light', color: 'secondary.dark', fontWeight: 800 }}>{me.display_name.slice(0, 1)}</Avatar>
@@ -43,7 +45,12 @@ export function AppShell() {
             <MenuItem disabled sx={{ opacity: '1 !important' }}><ListItemIcon><InfoOutlinedIcon fontSize="small" /></ListItemIcon><Stack><span>서비스 버전</span><Typography variant="caption" color="text.secondary">v{version?.version ?? '확인 중'} · API {version?.api_version ?? 'v1'}</Typography></Stack></MenuItem>
             <MenuItem onClick={logout}><ListItemIcon><LogoutRoundedIcon fontSize="small" /></ListItemIcon>로그아웃</MenuItem>
           </Menu>
-        </> : <Button component={RouterLink} to="/login" variant="contained" startIcon={<LoginRoundedIcon />}>로그인</Button>}
+        </> : ready ? <Button component={RouterLink} to="/login" variant="contained" startIcon={<LoginRoundedIcon />}>로그인</Button>
+          // Until the session lookup answers, a signed in visitor is
+          // indistinguishable from an anonymous one. Showing 로그인 in that gap
+          // and swapping it for their avatar a moment later reads as a glitch,
+          // so the slot holds its size and stays quiet.
+          : <Box sx={{ width: 104, height: 36 }} />}
       </Toolbar></Container>
     </AppBar>
     <Outlet />

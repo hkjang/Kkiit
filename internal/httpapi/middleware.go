@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"context"
 	"crypto/subtle"
 	"log/slog"
@@ -45,6 +46,53 @@ func (s *Server) csrf(next http.Handler) http.Handler {
 	})
 }
 
+// recorder remembers what was answered. It forwards Hijack and Flush because
+// the message socket upgrades the connection and would break behind a wrapper
+// that swallowed them.
+type recorder struct {
+	http.ResponseWriter
+	status  int
+	written int64
+}
+
+func (rec *recorder) WriteHeader(status int) {
+	if rec.status == 0 {
+		rec.status = status
+	}
+	rec.ResponseWriter.WriteHeader(status)
+}
+
+func (rec *recorder) Write(data []byte) (int, error) {
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	n, err := rec.ResponseWriter.Write(data)
+	rec.written += int64(n)
+	return n, err
+}
+
+func (rec *recorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := rec.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return hijacker.Hijack()
+}
+
+// Unwrap is what http.ResponseController follows to reach the connection
+// deadlines the message socket clears. Without it the wrapper silently blocks
+// that, and every WebSocket would be cut at the server's write timeout instead
+// of staying open.
+func (rec *recorder) Unwrap() http.ResponseWriter {
+	return rec.ResponseWriter
+}
+
+func (rec *recorder) Flush() {
+	if flusher, ok := rec.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func (s *Server) requestContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
@@ -53,8 +101,28 @@ func (s *Server) requestContext(next http.Handler) http.Handler {
 		}
 		w.Header().Set("X-Request-ID", requestID)
 		started := time.Now()
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey, requestID)))
-		s.Logger.Info("http request", "method", r.Method, "path", r.URL.Path, "request_id", requestID, "duration_ms", time.Since(started).Milliseconds())
+		rec := &recorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), requestIDKey, requestID)))
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		// Every request used to be one indistinguishable INFO line with no
+		// status, so a failure could not be found in the log at all, and the
+		// signal was buried under one line per asset on every page load.
+		// Failures are now loud and successful static reads are quiet.
+		level := slog.LevelInfo
+		switch {
+		case status >= 500:
+			level = slog.LevelError
+		case status >= 400:
+			level = slog.LevelWarn
+		case !strings.HasPrefix(r.URL.Path, "/api/") && !strings.HasPrefix(r.URL.Path, "/mcp"):
+			level = slog.LevelDebug
+		}
+		s.Logger.Log(r.Context(), level, "http request", "method", r.Method, "path", r.URL.Path,
+			"status", status, "bytes", rec.written, "request_id", requestID,
+			"duration_ms", time.Since(started).Milliseconds())
 	})
 }
 
@@ -162,29 +230,6 @@ func (s *Server) authenticateAPIKey(r *http.Request, token string) (Principal, b
 	p.Roles, p.Permissions, p.APIKeyID = roles, permissions, &keyID
 	_, _ = s.DB.Exec(r.Context(), `UPDATE api_keys SET last_used_at=now() WHERE id=$1 AND (last_used_at IS NULL OR last_used_at < now()-interval '5 minutes')`, keyID)
 	return p, true, false
-}
-
-func (s *Server) allowAPIKey(id uuid.UUID, limit int) bool {
-	if limit <= 0 {
-		return false
-	}
-	now := time.Now()
-	s.rateMu.Lock()
-	defer s.rateMu.Unlock()
-	if s.rate == nil {
-		s.rate = make(map[uuid.UUID]rateWindow)
-	}
-	window := s.rate[id]
-	if window.started.IsZero() || now.Sub(window.started) >= time.Minute {
-		s.rate[id] = rateWindow{started: now, count: 1}
-		return true
-	}
-	if window.count >= limit {
-		return false
-	}
-	window.count++
-	s.rate[id] = window
-	return true
 }
 
 func ipAllowed(ip net.IP, cidrs []string) bool {

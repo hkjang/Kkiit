@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -29,9 +31,9 @@ func (s *Server) listSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		var value any
 		_ = json.Unmarshal(raw, &value)
-		items = append(items, map[string]any{"key": key, "value": value, "is_secret": secret, "secret_configured": configured, "version": version, "description": description, "updated_at": updated})
+		items = append(items, map[string]any{"key": key, "value": value, "is_secret": secret, "secret_configured": configured, "version": version, "description": description, "connected": settingIsConnected(key), "updated_at": updated})
 	}
-	writeJSON(w, 200, map[string]any{"items": items})
+	writeJSON(w, 200, map[string]any{"items": items, "unconnected": unconnectedSettings})
 }
 
 func (s *Server) putSetting(w http.ResponseWriter, r *http.Request) {
@@ -44,6 +46,20 @@ func (s *Server) putSetting(w http.ResponseWriter, r *http.Request) {
 	}
 	if !decodeJSON(w, r, &input) {
 		return
+	}
+	// Turning off local login with no working provider is a one way door in an
+	// offline deployment: nobody, including the person making the change, can
+	// sign in afterwards and there is no console to recover from.
+	if key == "auth.security" {
+		if value, ok := input.Value.(map[string]any); ok {
+			if allowed, present := value["allow_local_login"].(bool); present && !allowed {
+				var providers int
+				if err := s.DB.QueryRow(r.Context(), `SELECT count(*) FROM auth_providers WHERE enabled`).Scan(&providers); err != nil || providers == 0 {
+					writeError(w, 409, "lockout_prevented", "활성화된 외부 인증 제공자가 없어 로컬 로그인을 끌 수 없습니다. 먼저 제공자를 활성화하고 로그인되는지 확인해 주세요.")
+					return
+				}
+			}
+		}
 	}
 	if key == "auth.oauth" {
 		value, ok := input.Value.(map[string]any)
@@ -267,6 +283,10 @@ func (s *Server) updateAuthProvider(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_provider", "인증 제공자 필수 설정을 확인해 주세요.")
 		return
 	}
+	if !in.Enabled && s.lastSignInMethodBlocked(r, id) {
+		writeError(w, 409, "lockout_prevented", "로컬 로그인이 꺼져 있어 마지막 인증 제공자를 비활성화할 수 없습니다. 먼저 로컬 로그인을 켜 주세요.")
+		return
+	}
 	var encrypted any
 	if in.ClientSecret != nil {
 		cipher, err := s.Box.Encrypt([]byte(*in.ClientSecret), "auth-provider:"+id.String())
@@ -289,9 +309,31 @@ func (s *Server) updateAuthProvider(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// lastSignInMethodBlocked reports whether removing or disabling this provider
+// would leave the deployment with no way to sign in at all.
+func (s *Server) lastSignInMethodBlocked(r *http.Request, providerID uuid.UUID) bool {
+	security, err := s.settingObject(r, "auth.security")
+	if err != nil {
+		return false
+	}
+	allowed, present := security["allow_local_login"].(bool)
+	if !present || allowed {
+		return false
+	}
+	var remaining int
+	if err := s.DB.QueryRow(r.Context(), `SELECT count(*) FROM auth_providers WHERE enabled AND id<>$1`, providerID).Scan(&remaining); err != nil {
+		return true
+	}
+	return remaining == 0
+}
+
 func (s *Server) deleteAuthProvider(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseUUIDPath(w, r, "id")
 	if !ok {
+		return
+	}
+	if s.lastSignInMethodBlocked(r, id) {
+		writeError(w, 409, "lockout_prevented", "로컬 로그인이 꺼져 있어 마지막 인증 제공자를 삭제할 수 없습니다. 먼저 로컬 로그인을 켜 주세요.")
 		return
 	}
 	var identityCount int
@@ -386,8 +428,40 @@ func (s *Server) updateRolePermissions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
-	limit := 100
-	rows, err := s.DB.Query(r.Context(), `SELECT id,occurred_at,actor_user_id,actor_roles,ip_address::text,action,resource_type,resource_id,before_data,after_data,request_id,result FROM audit_logs ORDER BY occurred_at DESC LIMIT $1`, limit)
+	limit := queryLimit(r, 100, 200)
+	cursorAt, cursorID := requestCursor(r)
+	// The audit table only grows, so it reads with a keyset cursor instead of a
+	// bare LIMIT that would silently hide everything past the first page.
+	//
+	// It also had no filters at all, which made it useless for the question it
+	// exists to answer. "Who changed this coupon" and "what did this account do"
+	// were both answered by paging through everything until you saw it.
+	args := []any{limit + 1, cursorAt, cursorID}
+	filters := ""
+	bind := func(value any) string {
+		args = append(args, value)
+		return "$" + strconv.Itoa(len(args))
+	}
+	if actor, parseErr := uuid.Parse(strings.TrimSpace(r.URL.Query().Get("actor"))); parseErr == nil {
+		filters += " AND actor_user_id=" + bind(actor)
+	}
+	if action := strings.TrimSpace(r.URL.Query().Get("action")); action != "" {
+		// A prefix match is what an operator means by "settings" or "order":
+		// the actions are named settings.update, order.transition and so on.
+		filters += " AND action LIKE " + bind(action+"%")
+	}
+	if resourceType := strings.TrimSpace(r.URL.Query().Get("resource_type")); resourceType != "" {
+		filters += " AND resource_type=" + bind(resourceType)
+	}
+	if resourceID := strings.TrimSpace(r.URL.Query().Get("resource_id")); resourceID != "" {
+		filters += " AND resource_id=" + bind(resourceID)
+	}
+	if result := strings.TrimSpace(r.URL.Query().Get("result")); result == "success" || result == "failure" {
+		filters += " AND result=" + bind(result)
+	}
+	rows, err := s.DB.Query(r.Context(), `SELECT id,occurred_at,actor_user_id,actor_roles,ip_address::text,action,resource_type,resource_id,before_data,after_data,request_id,result
+		FROM audit_logs WHERE ($2::timestamptz IS NULL OR (occurred_at,id) < ($2,$3))`+filters+`
+		ORDER BY occurred_at DESC,id DESC LIMIT $1`, args...)
 	if err != nil {
 		writeError(w, 500, "query_failed", "감사 로그를 조회하지 못했습니다.")
 		return
@@ -396,7 +470,7 @@ func (s *Server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0)
 	for rows.Next() {
 		var id uuid.UUID
-		var occurred any
+		var occurred time.Time
 		var actor *uuid.UUID
 		var roles []string
 		var ip *string
@@ -411,5 +485,27 @@ func (s *Server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(after, &a)
 		items = append(items, map[string]any{"id": id, "occurred_at": occurred, "actor_user_id": actor, "actor_roles": roles, "ip": ip, "action": action, "resource_type": typ, "resource_id": resource, "before": b, "after": a, "request_id": requestID, "result": result})
 	}
-	writeJSON(w, 200, map[string]any{"items": items})
+	items, next := pageResult(items, limit, func(item map[string]any) (time.Time, uuid.UUID) {
+		return timeField(item, "occurred_at"), uuidField(item, "id")
+	})
+	writeJSON(w, 200, map[string]any{"items": items, "next_cursor": next})
+}
+
+// unconnectedSettings hold values nothing reads yet: credentials for adapters
+// that are not written and policies for capabilities that are not built. They
+// stay in the table because they document the shape those features will take,
+// but an operator who edits one and expects the system to behave differently
+// has been misled by a screen that looked like every other setting.
+var unconnectedSettings = map[string]string{
+	"payment.credentials":      "결제 Adapter가 연결되면 사용합니다. 현재 결제는 manual 모드입니다.",
+	"storage.credentials":      "S3 호환 Storage Adapter가 연결되면 사용합니다. 현재 파일은 데이터베이스에 저장됩니다.",
+	"notification.credentials": "메일·SMS·Push 채널이 연결되면 사용합니다. 현재 알림은 웹 알림함과 웹훅으로만 전달됩니다.",
+	"agent.runtime":            "자율 Agent 실행 기능이 아직 없습니다.",
+	"observability.policy":     "OpenTelemetry 내보내기가 아직 없습니다. 요청 로그는 이 설정과 무관하게 항상 기록됩니다.",
+	"workflow.defaults":        "이벤트 재시도 한도는 notification.dispatch에서 읽습니다.",
+}
+
+func settingIsConnected(key string) bool {
+	_, unconnected := unconnectedSettings[key]
+	return !unconnected
 }

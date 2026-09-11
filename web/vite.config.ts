@@ -7,6 +7,20 @@ export default defineConfig({
     outDir: '../internal/ui/dist',
     emptyOutDir: true,
     sourcemap: false,
+    rolldownOptions: {
+      output: {
+        // React and MUI do not change between deploys, but application code
+        // does. Kept in one file with the app, a returning visitor re-downloads
+        // the whole framework to pick up a one line fix; split out, the cached
+        // vendor chunk survives the deploy.
+        manualChunks: (id: string) => {
+          if (!id.includes('node_modules')) return undefined
+          if (id.includes('@mui')) return 'mui'
+          if (id.includes('react-router') || id.includes('/react/') || id.includes('react-dom') || id.includes('scheduler')) return 'react'
+          return undefined
+        },
+      },
+    },
   },
   server: {
     port: 5173,

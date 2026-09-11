@@ -11,7 +11,20 @@ func (s *Server) live(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
+// BeginDrain marks the process as going away. Readiness fails from this moment
+// while the server keeps serving what is already in flight, which is the only
+// way a load balancer learns to stop sending new work here before the socket
+// closes. Without it a rolling deploy hands requests to a process that is
+// already shutting down and the caller sees a connection error.
+func (s *Server) BeginDrain() {
+	s.draining.Store(true)
+}
+
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
+	if s.draining.Load() {
+		writeError(w, http.StatusServiceUnavailable, "shutting_down", "종료 중이라 새 요청을 받지 않습니다.")
+		return
+	}
 	ctx, cancel := contextWithTimeout(r, 2*time.Second)
 	defer cancel()
 	if err := s.DB.Ping(ctx); err != nil {

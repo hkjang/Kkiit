@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -260,7 +261,13 @@ func (s *Server) oauthStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "encryption_failed", "인증 요청을 만들지 못했습니다.")
 		return
 	}
-	_, err = s.DB.Exec(r.Context(), `INSERT INTO oauth_states(state_hash,provider_id,verifier_encrypted,redirect_uri,expires_at) VALUES($1,$2,$3,$4,now()+interval '10 minutes')`, cryptox.Digest(state), provider.ID, encrypted, config.RedirectURL)
+	var linkUser any
+	if r.URL.Query().Get("link") == "1" {
+		if p, ok := principalFrom(r.Context()); ok {
+			linkUser = p.UserID
+		}
+	}
+	_, err = s.DB.Exec(r.Context(), `INSERT INTO oauth_states(state_hash,provider_id,verifier_encrypted,redirect_uri,expires_at,link_user_id) VALUES($1,$2,$3,$4,now()+interval '10 minutes',$5)`, cryptox.Digest(state), provider.ID, encrypted, config.RedirectURL, linkUser)
 	if err != nil {
 		writeError(w, 500, "state_failed", "인증 요청을 저장하지 못했습니다.")
 		return
@@ -287,7 +294,8 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	var providerID uuid.UUID
 	var encrypted []byte
 	var redirectURI string
-	err := s.DB.QueryRow(r.Context(), `DELETE FROM oauth_states WHERE state_hash=$1 AND expires_at>now() RETURNING provider_id,verifier_encrypted,redirect_uri`, cryptox.Digest(state)).Scan(&providerID, &encrypted, &redirectURI)
+	var linkUser *uuid.UUID
+	err := s.DB.QueryRow(r.Context(), `DELETE FROM oauth_states WHERE state_hash=$1 AND expires_at>now() RETURNING provider_id,verifier_encrypted,redirect_uri,link_user_id`, cryptox.Digest(state)).Scan(&providerID, &encrypted, &redirectURI, &linkUser)
 	if err != nil {
 		writeError(w, 400, "oauth_state_expired", "인증 요청이 만료되었거나 이미 사용되었습니다.")
 		return
@@ -326,8 +334,25 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "oauth_subject_missing", "인증 제공자의 사용자 식별자가 없습니다.")
 		return
 	}
+	if linkUser != nil {
+		// A signed in user asked to connect this provider, so the identity binds
+		// to their account instead of creating or matching one.
+		if err := s.linkIdentity(r, provider, subject, claims, *linkUser); err != nil {
+			writeError(w, 409, "identity_link_failed", err.Error())
+			return
+		}
+		s.audit(r, "identity.link", "user", linkUser.String(), nil, map[string]any{"provider": provider.Slug}, "success")
+		http.Redirect(w, r, "/profile/security", http.StatusFound)
+		return
+	}
 	userID, err := s.upsertExternalUser(r.Context(), provider, subject, email, name, claims)
 	if err != nil {
+		var refused errAccountLinkRefused
+		if errors.As(err, &refused) {
+			s.audit(r, "auth.oauth_link_refused", "user", "", nil, map[string]any{"provider": provider.Slug}, "failure")
+			writeError(w, 409, "account_link_refused", refused.Error())
+			return
+		}
 		s.Logger.Error("external user upsert failed", "error", err)
 		writeError(w, 500, "oauth_user_failed", "사용자 계정을 연결하지 못했습니다.")
 		return
@@ -544,11 +569,22 @@ func (s *Server) upsertExternalUser(ctx context.Context, p authProvider, subject
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var userID uuid.UUID
 	err = tx.QueryRow(ctx, `SELECT user_id FROM external_identities WHERE provider_id=$1 AND subject=$2`, p.ID, subject).Scan(&userID)
-	if err == pgx.ErrNoRows && email != "" {
-		err = tx.QueryRow(ctx, `SELECT id FROM users WHERE lower(email)=lower($1) AND status='active'`, email).Scan(&userID)
-	}
 	if err != nil && err != pgx.ErrNoRows {
 		return uuid.Nil, err
+	}
+	if err == pgx.ErrNoRows && email != "" {
+		candidate, account, lookupErr := lookupAccountByEmail(ctx, tx, email)
+		if lookupErr != nil {
+			return uuid.Nil, lookupErr
+		}
+		emailVerified, _ := claims[mappingValue(p.ClaimMapping, "email_verified", "email_verified")].(bool)
+		decision, message := decideAccountLink(account, emailVerified, s.linkByVerifiedEmail(ctx))
+		switch decision {
+		case linkToExistingAccount:
+			userID, err = candidate, nil
+		case linkRefused:
+			return uuid.Nil, errAccountLinkRefused{message: message}
+		}
 	}
 	if err == pgx.ErrNoRows {
 		userID = uuid.New()
@@ -600,4 +636,44 @@ func (s *Server) upsertExternalUser(ctx context.Context, p authProvider, subject
 	}
 	_, _ = tx.Exec(ctx, `UPDATE users SET last_login_at=now() WHERE id=$1`, userID)
 	return userID, tx.Commit(ctx)
+}
+
+// errAccountLinkRefused carries the guidance the person needs: sign in with the
+// method they already have, then connect the provider deliberately.
+type errAccountLinkRefused struct{ message string }
+
+func (e errAccountLinkRefused) Error() string { return e.message }
+
+func (s *Server) linkByVerifiedEmail(ctx context.Context) bool {
+	var raw []byte
+	if s.DB.QueryRow(ctx, `SELECT value FROM system_settings WHERE key='auth.oauth'`).Scan(&raw) != nil {
+		return true
+	}
+	var setting struct {
+		LinkByVerifiedEmail *bool `json:"link_by_verified_email"`
+	}
+	if json.Unmarshal(raw, &setting) != nil || setting.LinkByVerifiedEmail == nil {
+		return true
+	}
+	return *setting.LinkByVerifiedEmail
+}
+
+// linkIdentity binds a provider identity to an account that already exists. The
+// subject can belong to only one account, so a subject already in use is
+// refused rather than moved.
+func (s *Server) linkIdentity(r *http.Request, provider authProvider, subject string, claims map[string]any, user uuid.UUID) error {
+	var owner uuid.UUID
+	err := s.DB.QueryRow(r.Context(), `SELECT user_id FROM external_identities WHERE provider_id=$1 AND subject=$2`, provider.ID, subject).Scan(&owner)
+	if err == nil && owner != user {
+		return errAccountLinkRefused{message: "이 제공자 계정은 이미 다른 사용자에게 연결되어 있습니다."}
+	}
+	if err != nil && err != pgx.ErrNoRows {
+		return errAccountLinkRefused{message: "연결 상태를 확인하지 못했습니다."}
+	}
+	claimsJSON, _ := json.Marshal(claims)
+	if _, err := s.DB.Exec(r.Context(), `INSERT INTO external_identities(id,user_id,provider_id,subject,claims) VALUES($1,$2,$3,$4,$5)
+		ON CONFLICT(provider_id,subject) DO UPDATE SET claims=EXCLUDED.claims,last_login_at=now()`, uuid.New(), user, provider.ID, subject, claimsJSON); err != nil {
+		return errAccountLinkRefused{message: "계정을 연결하지 못했습니다."}
+	}
+	return nil
 }

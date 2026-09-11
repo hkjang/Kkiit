@@ -175,7 +175,14 @@ func (s *Server) listApprovalRequests(w http.ResponseWriter, r *http.Request) {
 	if state == "" {
 		state = "pending"
 	}
-	rows, err := s.DB.Query(r.Context(), `SELECT ar.id,ar.resource_type,ar.resource_id,ar.state,ar.current_step,ar.context,ar.requested_by,ar.decided_by,ar.decision_note,ar.created_at,ar.decided_at,ap.name FROM approval_requests ar JOIN approval_policies ap ON ap.id=ar.policy_id WHERE ar.state=$1 ORDER BY ar.created_at`, state)
+	// Pending requests are worked oldest first, because the seller who has been
+	// waiting longest for a decision is the one whose livelihood is stalled.
+	// Decided requests are history, so there the recent ones lead. The list was
+	// also unbounded, which was fine while only pending requests were viewed and
+	// wrong the moment someone asked for every approval ever made.
+	rows, err := s.DB.Query(r.Context(), `SELECT ar.id,ar.resource_type,ar.resource_id,ar.state,ar.current_step,ar.context,ar.requested_by,ar.decided_by,ar.decision_note,ar.created_at,ar.decided_at,ap.name
+		FROM approval_requests ar JOIN approval_policies ap ON ap.id=ar.policy_id WHERE ar.state=$1
+		ORDER BY CASE WHEN ar.state='pending' THEN ar.created_at END ASC, ar.created_at DESC LIMIT $2`, state, queryLimit(r, 100, 500))
 	if err != nil {
 		writeError(w, 500, "query_failed", "승인 대기열을 조회하지 못했습니다.")
 		return
@@ -196,9 +203,13 @@ func (s *Server) listApprovalRequests(w http.ResponseWriter, r *http.Request) {
 		}
 		var context any
 		_ = json.Unmarshal(raw, &context)
-		items = append(items, map[string]any{"id": id, "resource_type": typ, "resource_id": resourceID, "state": state, "current_step": step, "context": context, "requested_by": requested, "decided_by": decided, "decision_note": note, "created_at": created, "decided_at": decidedAt, "policy_name": policy})
+		waiting := 0
+		if state == "pending" {
+			waiting = int(time.Since(created).Hours())
+		}
+		items = append(items, map[string]any{"id": id, "resource_type": typ, "resource_id": resourceID, "state": state, "current_step": step, "context": context, "requested_by": requested, "decided_by": decided, "decision_note": note, "created_at": created, "decided_at": decidedAt, "policy_name": policy, "waiting_hours": waiting})
 	}
-	writeJSON(w, 200, map[string]any{"items": items})
+	writeJSON(w, 200, map[string]any{"items": items, "sla_hours": s.approvalSLAHours(r)})
 }
 
 func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
@@ -243,7 +254,7 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
 			if status == "rejected" {
 				event = "TalentRejected"
 			}
-			_, err = tx.Exec(r.Context(), `INSERT INTO domain_events(id,aggregate_type,aggregate_id,event_type,payload) VALUES($1,'talent',$2,$3,$4)`, uuid.New(), resourceID, event, map[string]any{"approval_request_id": id, "decided_by": p.UserID})
+			err = emitEvent(r.Context(), tx, "talent", resourceID, event, map[string]any{"approval_request_id": id, "decided_by": p.UserID, "note": in.Note})
 		}
 	}
 	if err != nil {
@@ -256,4 +267,74 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "approval.decide", "approval_request", id.String(), nil, in, "success")
 	writeJSON(w, 200, map[string]any{"ok": true, "state": in.Decision})
+}
+
+// approvalSLAHours is how long a submission may wait for a decision before the
+// console calls it out. A seller cannot sell while their listing sits in a
+// queue, so the wait is a promise the platform makes to them.
+func (s *Server) approvalSLAHours(r *http.Request) int {
+	policy, err := s.settingObject(r, "sla.policy")
+	if err != nil {
+		return 48
+	}
+	return intSetting(policy, "approval_hours", 48)
+}
+
+// getAdminApprovalRequest is the listing an operator is being asked to approve.
+// The request itself carries only a title, so the review screen showed a name
+// and a policy and nothing else: the description, the price, the packages, who
+// is selling — none of it. Approving content you cannot see is not a review,
+// and this is the gate the marketplace's quality rests on.
+//
+// The listing is read as it stands now rather than as it was when submitted,
+// because what gets published is the current version.
+func (s *Server) getAdminApprovalRequest(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseUUIDPath(w, r, "id")
+	if !ok {
+		return
+	}
+	var raw []byte
+	err := s.DB.QueryRow(r.Context(), `SELECT jsonb_build_object(
+			'id',ar.id,'state',ar.state,'current_step',ar.current_step,'context',ar.context,
+			'created_at',ar.created_at,'decided_at',ar.decided_at,'decision_note',ar.decision_note,
+			'resource_type',ar.resource_type,'resource_id',ar.resource_id,
+			'policy',jsonb_build_object('name',ap.name,'steps',ap.steps,'conditions',ap.conditions),
+			'requested_by',(SELECT jsonb_build_object('id',ru.id,'display_name',ru.display_name) FROM users ru WHERE ru.id=ar.requested_by),
+			-- Was this rejected before and sent back? That is the first thing a
+			-- reviewer wants to know and it was nowhere on the screen.
+			'previous',COALESCE((SELECT jsonb_agg(jsonb_build_object('at',x.decided_at,'state',x.state,'note',x.decision_note)
+					ORDER BY x.decided_at DESC)
+				FROM approval_requests x WHERE x.resource_type=ar.resource_type AND x.resource_id=ar.resource_id
+					AND x.id<>ar.id AND x.state<>'pending'),'[]'::jsonb),
+			'talent',CASE WHEN ar.resource_type='talent_publish' THEN (
+				SELECT jsonb_build_object('id',t.id,'title',t.title,'summary',t.summary,'description',t.description,
+					'status',t.status,'service_type',t.service_type,'base_price',t.base_price,'currency',t.currency,
+					'delivery_days',t.delivery_days,'revision_count',t.revision_count,'tags',t.tags,
+					'scope_included',t.scope_included,'scope_excluded',t.scope_excluded,'deliverables',t.deliverables,
+					'faq',t.faq,'refund_policy',t.refund_policy,'quality_score',t.quality_score,
+					'category',(SELECT c.name FROM categories c WHERE c.id=t.category_id),
+					'packages',COALESCE((SELECT jsonb_agg(jsonb_build_object('name',p.name,'price',p.price,
+						'delivery_days',p.delivery_days,'description',p.description) ORDER BY p.sort_order)
+						FROM talent_packages p WHERE p.talent_id=t.id),'[]'::jsonb),
+					'seller',jsonb_build_object('id',su.id,'display_name',su.display_name,'status',su.status,
+						'level',COALESCE(sp.level,'NEW'),'rating',COALESCE(sp.rating,0),
+						'published_talents',(SELECT count(*) FROM talents x WHERE x.seller_id=su.id AND x.status='published'),
+						'rejected_talents',(SELECT count(*) FROM talents x WHERE x.seller_id=su.id AND x.status='rejected'),
+						'reports_against',(SELECT count(*) FROM reports rp WHERE rp.resource_type='user' AND rp.resource_id=su.id)))
+				FROM talents t JOIN users su ON su.id=t.seller_id
+				LEFT JOIN seller_profiles sp ON sp.user_id=t.seller_id WHERE t.id=ar.resource_id)
+				ELSE NULL END
+		) FROM approval_requests ar JOIN approval_policies ap ON ap.id=ar.policy_id WHERE ar.id=$1`, id).Scan(&raw)
+	if err == pgx.ErrNoRows {
+		writeError(w, 404, "approval_not_found", "승인 요청을 찾을 수 없습니다.")
+		return
+	}
+	if err != nil {
+		s.Logger.Error("admin approval detail failed", "error", err.Error(), "request", id.String())
+		writeError(w, 500, "query_failed", "승인 요청을 조회하지 못했습니다.")
+		return
+	}
+	var payload any
+	_ = json.Unmarshal(raw, &payload)
+	writeJSON(w, 200, payload)
 }

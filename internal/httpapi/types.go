@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,16 +18,23 @@ import (
 )
 
 type Server struct {
-	DB               *pgxpool.Pool
-	Box              *cryptox.Box
-	Version          string
-	Commit           string
-	BuiltAt          string
-	Logger           *slog.Logger
-	rateMu           sync.Mutex
-	rate             map[uuid.UUID]rateWindow
-	hubMu            sync.Mutex
-	orderSubscribers map[uuid.UUID]map[chan []byte]struct{}
+	DB      *pgxpool.Pool
+	Box     *cryptox.Box
+	Version string
+	Commit  string
+	BuiltAt string
+	Logger  *slog.Logger
+	// Rescan triggers the background risk and settlement analyses on demand.
+	// It is nil when the process runs without a dispatcher.
+	Rescan        func(ctx context.Context) (risk int, settlements int)
+	rateMu        sync.Mutex
+	rate          map[string]rateWindow
+	featureMu     sync.Mutex
+	featureCache  map[string]bool
+	featureLoaded time.Time
+	hubMu         sync.Mutex
+	topics        map[string]map[chan []byte]struct{}
+	draining      atomic.Bool
 }
 
 type rateWindow struct {

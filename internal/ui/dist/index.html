@@ -6,7 +6,27 @@
     <meta name="theme-color" content="#0b203a" />
     <meta name="description" content="사람과 AI의 전문 서비스를 연결하는 Kkiit 마켓플레이스" />
     <title>Kkiit</title>
-    <script type="module" crossorigin src="/assets/index-DCYmZoST.js"></script>
+    <!--
+      The framework bundle has to parse before React can draw anything, and an
+      empty root means a white page until it does. This paints the page's own
+      background and a quiet mark immediately; React replaces it on mount.
+    -->
+    <style>
+      html, body { margin: 0; background: #f5f7fb; }
+      #root:empty::after {
+        content: 'Kkiit';
+        display: grid;
+        place-items: center;
+        min-height: 100vh;
+        color: #b6c2d6;
+        font: 800 1.5rem/1 system-ui, -apple-system, 'Segoe UI', 'Malgun Gothic', sans-serif;
+        letter-spacing: .04em;
+      }
+    </style>
+    <script type="module" crossorigin src="/assets/index-R8n3q54G.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-CbXtAM7H.js">
+    <link rel="modulepreload" crossorigin href="/assets/mui-CG1VbL8r.js">
+    <link rel="modulepreload" crossorigin href="/assets/react-BU2nbdNn.js">
     <link rel="stylesheet" crossorigin href="/assets/index-PGJBh3nL.css">
   </head>
   <body>

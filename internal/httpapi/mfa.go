@@ -93,11 +93,15 @@ func (s *Server) confirmTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret, err := s.Box.Decrypt(encrypted, "mfa:"+id.String())
-	if err != nil || !verifyTOTP(string(secret), code, time.Now()) {
+	step, matched := int64(0), false
+	if err == nil {
+		step, matched = matchTOTPStep(string(secret), code, time.Now())
+	}
+	if err != nil || !matched {
 		writeError(w, 400, "invalid_mfa_code", "인증 앱의 6자리 코드를 확인해 주세요.")
 		return
 	}
-	if _, err := s.DB.Exec(r.Context(), `UPDATE mfa_factors SET enabled=true,confirmed_at=now(),last_used_at=now() WHERE id=$1`, id); err != nil {
+	if _, err := s.DB.Exec(r.Context(), `UPDATE mfa_factors SET enabled=true,confirmed_at=now(),last_used_at=now(),last_step=$2 WHERE id=$1`, id, step); err != nil {
 		writeError(w, 500, "mfa_confirm_failed", "MFA를 활성화하지 못했습니다.")
 		return
 	}
@@ -160,25 +164,41 @@ func (s *Server) verifyLoginTOTP(ctx context.Context, userID uuid.UUID, code str
 	if err != nil {
 		return true, false, err
 	}
-	if !verifyTOTP(string(secret), strings.TrimSpace(code), time.Now()) {
+	step, ok := matchTOTPStep(string(secret), strings.TrimSpace(code), time.Now())
+	if !ok {
 		return true, false, nil
 	}
-	_, _ = s.DB.Exec(ctx, `UPDATE mfa_factors SET last_used_at=now() WHERE id=$1`, id)
+	// The conditional update is the replay guard: only the first use of a step
+	// changes a row, so a repeated code finds nothing to claim.
+	tag, err := s.DB.Exec(ctx, `UPDATE mfa_factors SET last_used_at=now(),last_step=$2 WHERE id=$1 AND last_step<$2`, id, step)
+	if err != nil {
+		return true, false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return true, false, nil
+	}
 	return true, true, nil
 }
 
 func verifyTOTP(secret, code string, at time.Time) bool {
+	_, ok := matchTOTPStep(secret, code, at)
+	return ok
+}
+
+// matchTOTPStep returns the time step a code belongs to. The caller stores it
+// so the same code cannot be presented twice while its window is still open.
+func matchTOTPStep(secret, code string, at time.Time) (int64, bool) {
 	decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.TrimSpace(secret)))
 	if err != nil || len(code) != 6 {
-		return false
+		return 0, false
 	}
 	counter := at.Unix() / int64(totpPeriod/time.Second)
 	for drift := int64(-1); drift <= 1; drift++ {
 		if subtle.ConstantTimeCompare([]byte(totpCode(decoded, uint64(counter+drift))), []byte(code)) == 1 {
-			return true
+			return counter + drift, true
 		}
 	}
-	return false
+	return 0, false
 }
 
 func totpCode(secret []byte, counter uint64) string {

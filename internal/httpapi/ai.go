@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/hkjang/Kkiit/internal/netguard"
 )
 
 func (s *Server) aiTalentDraft(w http.ResponseWriter, r *http.Request) {
@@ -30,7 +33,7 @@ func (s *Server) aiTalentDraft(w http.ResponseWriter, r *http.Request) {
 	result, meta, err := s.completeJSON(r.Context(), "talent_draft", system, in.Idea, "balanced")
 	if err != nil {
 		result = localTalentDraft(in.Idea)
-		meta = map[string]any{"mode": "offline_template", "warning": "AI Gateway가 비활성화되었거나 응답하지 않아 로컬 템플릿을 사용했습니다."}
+		meta = map[string]any{"mode": "offline_template", "warning": aiFallbackReason(err)}
 	}
 	writeJSON(w, 200, map[string]any{"draft": result, "meta": meta})
 }
@@ -52,7 +55,7 @@ func (s *Server) aiRequirementAnalysis(w http.ResponseWriter, r *http.Request) {
 	result, meta, err := s.completeJSON(r.Context(), "requirement_analysis", system, in.Text, "balanced")
 	if err != nil {
 		result = map[string]any{"intent": in.Text, "requirements": []string{in.Text}, "missing_information": []string{"예산", "희망 납기", "산출물 형식"}, "follow_up_questions": []string{"예산 범위는 얼마인가요?", "희망 납기일은 언제인가요?", "필요한 최종 산출물은 무엇인가요?"}, "completeness_score": 40, "ready": false}
-		meta = map[string]any{"mode": "offline_template", "warning": "AI Gateway가 비활성화되었거나 응답하지 않아 로컬 분석을 사용했습니다."}
+		meta = map[string]any{"mode": "offline_template", "warning": aiFallbackReason(err)}
 	}
 	writeJSON(w, 200, map[string]any{"analysis": result, "meta": meta})
 }
@@ -63,17 +66,22 @@ func (s *Server) completeJSON(ctx context.Context, feature, system, user, tier s
 	if err := s.DB.QueryRow(ctx, `SELECT value FROM system_settings WHERE key='ai.gateway'`).Scan(&settingRaw); err != nil {
 		return nil, nil, err
 	}
-	var setting struct {
-		Enabled bool              `json:"enabled"`
-		BaseURL string            `json:"base_url"`
-		Models  map[string]string `json:"models"`
-	}
+	var setting aiGatewaySetting
 	if err := json.Unmarshal(settingRaw, &setting); err != nil || !setting.Enabled || setting.BaseURL == "" {
 		return nil, nil, fmt.Errorf("AI gateway disabled")
 	}
 	model := setting.Models[tier]
 	if model == "" {
 		return nil, nil, fmt.Errorf("AI model for %s is not configured", tier)
+	}
+	// Refusing here is what makes the monthly budget real. The callers fall back
+	// to their local template, so exceeding the budget degrades the feature
+	// instead of failing the request.
+	if setting.MonthlyBudget > 0 {
+		spent, err := s.aiSpendThisMonth(ctx)
+		if err == nil && spent >= setting.MonthlyBudget {
+			return nil, nil, errAIBudgetExhausted{spent: spent, budget: setting.MonthlyBudget}
+		}
 	}
 	apiKey := ""
 	if err := s.DB.QueryRow(ctx, `SELECT encrypted_value FROM system_settings WHERE key='ai.gateway.credentials'`).Scan(&encrypted); err == nil && len(encrypted) > 0 {
@@ -99,7 +107,7 @@ func (s *Server) completeJSON(ctx context.Context, feature, system, user, tier s
 		request.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	started := time.Now()
-	response, err := http.DefaultClient.Do(request)
+	response, err := netguard.Client(60*time.Second, true).Do(request)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -137,7 +145,53 @@ func (s *Server) completeJSON(ctx context.Context, feature, system, user, tier s
 	p, _ := principalFrom(ctx)
 	latency := time.Since(started).Milliseconds()
 	_, _ = s.DB.Exec(ctx, `INSERT INTO ai_executions(id,user_id,feature,model,state,input_tokens,output_tokens,latency_ms,response_data) VALUES($1,$2,$3,$4,'completed',$5,$6,$7,$8)`, executionID, nullableUUID(p.UserID), feature, model, completion.Usage.PromptTokens, completion.Usage.CompletionTokens, latency, result)
-	return result, map[string]any{"mode": "gateway", "model": model, "execution_id": executionID, "latency_ms": latency}, nil
+	cost := estimateAICost(setting.Pricing[model], completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
+	_, _ = s.DB.Exec(ctx, `INSERT INTO ai_usage(id,execution_id,user_id,feature,model,input_tokens,output_tokens,estimated_cost) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+		uuid.New(), executionID, nullableUUID(p.UserID), feature, model, completion.Usage.PromptTokens, completion.Usage.CompletionTokens, cost)
+	return result, map[string]any{"mode": "gateway", "model": model, "execution_id": executionID, "latency_ms": latency, "estimated_cost": cost}, nil
+}
+
+// aiGatewaySetting is the operator configured gateway, including what each
+// model costs so token counts can be turned into spend.
+type aiGatewaySetting struct {
+	Enabled       bool                 `json:"enabled"`
+	BaseURL       string               `json:"base_url"`
+	Models        map[string]string    `json:"models"`
+	MonthlyBudget float64              `json:"monthly_budget"`
+	Currency      string               `json:"currency"`
+	Pricing       map[string]aiPricing `json:"pricing"`
+}
+
+type aiPricing struct {
+	InputPer1K  float64 `json:"input_per_1k"`
+	OutputPer1K float64 `json:"output_per_1k"`
+}
+
+// estimateAICost is an estimate by construction: it uses the operator's own
+// price list, which is the only cost information a self hosted deployment has.
+func estimateAICost(pricing aiPricing, inputTokens, outputTokens int) float64 {
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	if outputTokens < 0 {
+		outputTokens = 0
+	}
+	return float64(inputTokens)/1000*pricing.InputPer1K + float64(outputTokens)/1000*pricing.OutputPer1K
+}
+
+type errAIBudgetExhausted struct {
+	spent  float64
+	budget float64
+}
+
+func (e errAIBudgetExhausted) Error() string {
+	return fmt.Sprintf("AI monthly budget exhausted: %.4f of %.4f", e.spent, e.budget)
+}
+
+func (s *Server) aiSpendThisMonth(ctx context.Context) (float64, error) {
+	var spent float64
+	err := s.DB.QueryRow(ctx, `SELECT COALESCE(sum(estimated_cost),0) FROM ai_usage WHERE occurred_at >= date_trunc('month', now())`).Scan(&spent)
+	return spent, err
 }
 
 func localTalentDraft(idea string) map[string]any {
@@ -146,4 +200,14 @@ func localTalentDraft(idea string) map[string]any {
 		title = string([]rune(title)[:70])
 	}
 	return map[string]any{"title": title, "summary": "전문가가 요구사항을 확인하고 결과물을 제공합니다.", "description": idea, "category": "기타 전문 서비스", "tags": []string{}, "base_price": 100000, "delivery_days": 3, "revision_count": 1, "deliverables": []string{"최종 결과물"}, "faq": []map[string]string{{"question": "작업 전 무엇이 필요한가요?", "answer": "목표, 참고자료와 희망 일정을 알려주세요."}}, "packages": []map[string]any{{"package_type": "BASIC", "name": "기본", "description": "기본 작업 범위", "price": 100000, "delivery_days": 3, "revision_count": 1, "features": []string{}}}, "requirements": []map[string]any{{"label": "상세 요구사항", "help_text": "목표와 참고자료를 입력하세요.", "field_type": "textarea", "required": true, "options": []string{}}}}
+}
+
+// aiFallbackReason explains the degrade so an operator can tell a spent budget
+// from an unreachable gateway.
+func aiFallbackReason(err error) string {
+	var exhausted errAIBudgetExhausted
+	if errors.As(err, &exhausted) {
+		return "이번 달 AI 예산을 모두 사용해 로컬 템플릿을 사용했습니다. 관리자 AI 설정에서 예산을 확인해 주세요."
+	}
+	return "AI Gateway가 비활성화되었거나 응답하지 않아 로컬 템플릿을 사용했습니다."
 }

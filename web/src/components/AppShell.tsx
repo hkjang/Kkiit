@@ -12,6 +12,7 @@ import LoginRoundedIcon from '@mui/icons-material/LoginRounded'
 import { Brand } from './Brand'
 import { NotificationBell } from './NotificationBell'
 import { api } from '../api'
+import { markSignedOut } from '../silentSso'
 import { useApp } from '../App'
 
 export function AppShell() {
@@ -19,7 +20,9 @@ export function AppShell() {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null)
   const navigate = useNavigate()
   const logout = async () => {
-    try { await api('/api/v1/auth/logout', { method: 'POST' }); await refreshMe(); navigate('/login') }
+    // Marked as soon as the session is gone so a silent sign in cannot undo
+    // the sign out on the next page load.
+    try { await api('/api/v1/auth/logout', { method: 'POST' }); markSignedOut(); await refreshMe(); navigate('/login') }
     catch (error) { notify(error instanceof Error ? error.message : '로그아웃하지 못했습니다.', 'error') }
   }
   return <Box sx={{ minHeight: '100vh' }}>

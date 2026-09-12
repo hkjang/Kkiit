@@ -41,8 +41,19 @@ type authProvider struct {
 	Options               map[string]any
 }
 
+// providerAutoLogin reports whether the administrator turned on silent sign in
+// (prompt=none) for this provider. It is off unless the option says otherwise,
+// and only an OIDC provider understands the prompt parameter at all.
+func providerAutoLogin(p authProvider) bool {
+	if p.ProviderType != "oidc" {
+		return false
+	}
+	enabled, _ := p.Options["auto_login"].(bool)
+	return enabled
+}
+
 func (s *Server) listEnabledProviders(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.DB.Query(r.Context(), `SELECT slug,name,preset FROM auth_providers WHERE enabled ORDER BY name`)
+	rows, err := s.DB.Query(r.Context(), `SELECT slug,name,preset,provider_type,options FROM auth_providers WHERE enabled ORDER BY name`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "query_failed", "인증 제공자를 조회하지 못했습니다.")
 		return
@@ -50,12 +61,27 @@ func (s *Server) listEnabledProviders(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	providers := make([]map[string]any, 0)
 	for rows.Next() {
-		var slug, name, preset string
-		if err := rows.Scan(&slug, &name, &preset); err == nil {
-			providers = append(providers, map[string]any{"slug": slug, "name": name, "preset": preset, "login_url": "/api/v1/auth/oauth/" + slug + "/start"})
+		var p authProvider
+		var options []byte
+		if err := rows.Scan(&p.Slug, &p.Name, &p.Preset, &p.ProviderType, &options); err == nil {
+			_ = json.Unmarshal(options, &p.Options)
+			// auto_login is published so the browser knows whether to try a
+			// silent sign in before it shows the login screen.
+			providers = append(providers, map[string]any{"slug": p.Slug, "name": p.Name, "preset": p.Preset, "login_url": "/api/v1/auth/oauth/" + p.Slug + "/start", "auto_login": providerAutoLogin(p)})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": providers})
+}
+
+// safeReturnTo accepts only a same-origin path, so the sign in flow cannot be
+// used as a springboard to another site. "//host" is a scheme-relative URL and
+// is refused with the rest.
+func safeReturnTo(value string) bool {
+	if value == "" || !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") || strings.ContainsAny(value, "\r\n\\") {
+		return false
+	}
+	parsed, err := url.Parse(value)
+	return err == nil && !parsed.IsAbs() && parsed.Host == ""
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -267,18 +293,49 @@ func (s *Server) oauthStart(w http.ResponseWriter, r *http.Request) {
 			linkUser = p.UserID
 		}
 	}
-	_, err = s.DB.Exec(r.Context(), `INSERT INTO oauth_states(state_hash,provider_id,verifier_encrypted,redirect_uri,expires_at,link_user_id) VALUES($1,$2,$3,$4,now()+interval '10 minutes',$5)`, cryptox.Digest(state), provider.ID, encrypted, config.RedirectURL, linkUser)
+	// prompt=none asks the provider to answer from an existing session only. It
+	// never renders a screen: either a code comes straight back, or an error
+	// such as login_required does. The browser may only ask for it when the
+	// administrator turned auto_login on for this provider; otherwise the
+	// request quietly becomes an ordinary sign in, so nobody can change the
+	// flow by editing the address.
+	silent := r.URL.Query().Get("prompt") == "none" && linkUser == nil && providerAutoLogin(provider)
+	returnTo := r.URL.Query().Get("return_to")
+	if !safeReturnTo(returnTo) {
+		returnTo = "/"
+	}
+	_, err = s.DB.Exec(r.Context(), `INSERT INTO oauth_states(state_hash,provider_id,verifier_encrypted,redirect_uri,expires_at,link_user_id,silent,return_to) VALUES($1,$2,$3,$4,now()+interval '10 minutes',$5,$6,$7)`, cryptox.Digest(state), provider.ID, encrypted, config.RedirectURL, linkUser, silent, returnTo)
 	if err != nil {
 		writeError(w, 500, "state_failed", "인증 요청을 저장하지 못했습니다.")
 		return
 	}
-	http.Redirect(w, r, config.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("code_challenge", challenge), oauth2.SetAuthURLParam("code_challenge_method", "S256")), http.StatusFound)
+	options := []oauth2.AuthCodeOption{oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("code_challenge", challenge), oauth2.SetAuthURLParam("code_challenge_method", "S256")}
+	if silent {
+		options = append(options, oauth2.SetAuthURLParam("prompt", "none"))
+	}
+	http.Redirect(w, r, config.AuthCodeURL(state, options...), http.StatusFound)
 }
+
+// silentSsoRefusedPath is where a refused prompt=none attempt lands. The query
+// marker tells the browser not to try again even if its storage was cleared;
+// without it the page would bounce between the provider and here forever.
+const silentSsoRefusedPath = "/login?sso=none"
 
 func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	code := r.URL.Query().Get("code")
 	if providerError := strings.TrimSpace(r.URL.Query().Get("error")); providerError != "" {
+		// A silent attempt answered with login_required (or one of its
+		// siblings) is the ordinary "no session" reply, not a failure. The
+		// state row is consumed either way so the answer cannot be replayed.
+		var silent bool
+		if state != "" {
+			_ = s.DB.QueryRow(r.Context(), `DELETE FROM oauth_states WHERE state_hash=$1 RETURNING silent`, cryptox.Digest(state)).Scan(&silent)
+		}
+		if silent {
+			http.Redirect(w, r, silentSsoRefusedPath, http.StatusFound)
+			return
+		}
 		description := strings.TrimSpace(r.URL.Query().Get("error_description"))
 		if description == "" {
 			description = "인증 제공자가 로그인 요청을 거절했습니다."
@@ -293,9 +350,9 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	var providerID uuid.UUID
 	var encrypted []byte
-	var redirectURI string
+	var redirectURI, returnTo string
 	var linkUser *uuid.UUID
-	err := s.DB.QueryRow(r.Context(), `DELETE FROM oauth_states WHERE state_hash=$1 AND expires_at>now() RETURNING provider_id,verifier_encrypted,redirect_uri,link_user_id`, cryptox.Digest(state)).Scan(&providerID, &encrypted, &redirectURI, &linkUser)
+	err := s.DB.QueryRow(r.Context(), `DELETE FROM oauth_states WHERE state_hash=$1 AND expires_at>now() RETURNING provider_id,verifier_encrypted,redirect_uri,link_user_id,return_to`, cryptox.Digest(state)).Scan(&providerID, &encrypted, &redirectURI, &linkUser, &returnTo)
 	if err != nil {
 		writeError(w, 400, "oauth_state_expired", "인증 요청이 만료되었거나 이미 사용되었습니다.")
 		return
@@ -363,7 +420,13 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	auditRequest := r.WithContext(context.WithValue(r.Context(), principalKey, Principal{UserID: userID, Roles: []string{}}))
 	s.audit(auditRequest, "auth.oauth_login", "user", userID.String(), nil, map[string]any{"provider": provider.Slug}, "success")
-	http.Redirect(w, r, "/", http.StatusFound)
+	// Someone who arrived through a deep link goes back to that page, not to
+	// the front door. The value was checked when the state was created, and is
+	// checked again here so a stored row can never redirect off site.
+	if !safeReturnTo(returnTo) {
+		returnTo = "/"
+	}
+	http.Redirect(w, r, returnTo, http.StatusFound)
 }
 
 func (s *Server) loadAuthProvider(ctx context.Context, slug string, enabledOnly bool) (authProvider, error) {

@@ -33,4 +33,4 @@ release: docker
 check:
 	go test $(GO_PACKAGES)
 	go vet $(GO_PACKAGES)
-	cd web && npm ci --ignore-scripts && npm run lint && npm run build
+	cd web && npm ci --ignore-scripts && npm run lint && npm test && npm run build

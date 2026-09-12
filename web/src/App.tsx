@@ -2,7 +2,8 @@ import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useM
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { Alert, Box, CircularProgress, Snackbar } from '@mui/material'
 import { api, onUnauthorized } from './api'
-import type { Principal, VersionInfo } from './types'
+import { autoLoginProvider, beginSilentSso, clearSilentSsoState, shouldAttemptSilentSso } from './silentSso'
+import type { AuthProvider, Principal, VersionInfo } from './types'
 import { LoginPage } from './pages/LoginPage'
 import { MarketplacePage } from './pages/MarketplacePage'
 import { OrdersPage } from './pages/OrdersPage'
@@ -23,7 +24,7 @@ type AppContextValue = {
   features: Record<string, boolean>
   /** false until the session lookup has answered; who is signed in is unknown before that. */
   ready: boolean
-  refreshMe: () => Promise<void>
+  refreshMe: () => Promise<Principal | null>
   notify: (message: string, severity?: 'success' | 'error' | 'info' | 'warning') => void
 }
 
@@ -42,17 +43,31 @@ export function App() {
   const [notice, setNotice] = useState<{ message: string; severity: 'success' | 'error' | 'info' | 'warning' } | null>(null)
 
   const refreshMe = useCallback(async () => {
-    try { setMe(await api<Principal>('/api/v1/me')) } catch { setMe(null) }
+    try { const principal = await api<Principal>('/api/v1/me'); setMe(principal); return principal } catch { setMe(null); return null }
   }, [])
 
   useEffect(() => {
+    // Set when the browser is being sent to the identity provider: the page is
+    // about to unload, so it stays in the bootstrapping state rather than
+    // flashing a login screen on the way out.
+    let leaving = false
     Promise.all([
-      refreshMe(),
+      refreshMe().then(async (principal) => {
+        // An anonymous visitor may already be signed in at the identity
+        // provider. The provider list is only fetched when it could matter,
+        // and silentSso decides whether this page load may try at all.
+        if (principal || !shouldAttemptSilentSso()) return
+        const providers = await api<{ items: AuthProvider[] }>('/api/v1/auth/providers').catch(() => ({ items: [] as AuthProvider[] }))
+        const provider = autoLoginProvider(providers.items)
+        if (!provider) return
+        leaving = true
+        beginSilentSso(provider, `${window.location.pathname}${window.location.search}`)
+      }),
       api<VersionInfo>('/api/v1/version').then(setVersion).catch(() => undefined),
       // A deployment can switch features off, so the app asks what is available
       // instead of assuming every section exists.
       api<{ features: Record<string, boolean> }>('/api/v1/features').then((data) => setFeatures(data.features ?? {})).catch(() => undefined),
-    ]).finally(() => setReady(true))
+    ]).finally(() => { if (!leaving) setReady(true) })
   }, [refreshMe])
 
   // Registered only while signed in: an anonymous visitor's session probe also
@@ -60,6 +75,9 @@ export function App() {
   // marketplace they came to browse.
   useEffect(() => {
     if (!me) { onUnauthorized(null); return }
+    // A session exists again, so a deliberate sign out no longer needs to
+    // suppress silent sign in.
+    clearSilentSsoState()
     onUnauthorized(() => {
       setMe(null)
       setNotice({ message: '로그인 세션이 만료되었습니다. 다시 로그인해 주세요.', severity: 'warning' })

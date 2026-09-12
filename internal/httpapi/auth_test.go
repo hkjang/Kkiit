@@ -59,6 +59,34 @@ func TestValidateProviderRejectsInvalidSlugAndURL(t *testing.T) {
 	}
 }
 
+func TestSafeReturnToAcceptsOnlySameOriginPaths(t *testing.T) {
+	for _, value := range []string{"/", "/orders/42", "/talents/7?tab=reviews", "/profile/security#mfa"} {
+		if !safeReturnTo(value) {
+			t.Errorf("same-origin path refused: %q", value)
+		}
+	}
+	for _, value := range []string{"", "orders", "//evil.example.com/", "/\\evil.example.com", "https://evil.example.com/", "javascript:alert(1)", "/orders\r\nSet-Cookie: x=y"} {
+		if safeReturnTo(value) {
+			t.Errorf("unsafe return_to accepted: %q", value)
+		}
+	}
+}
+
+func TestProviderAutoLoginIsOffUnlessAnOIDCProviderSaysOtherwise(t *testing.T) {
+	if providerAutoLogin(authProvider{ProviderType: "oidc"}) {
+		t.Fatal("auto_login must default to off")
+	}
+	if providerAutoLogin(authProvider{ProviderType: "oidc", Options: map[string]any{"auto_login": "true"}}) {
+		t.Fatal("a non-boolean option must not turn auto_login on")
+	}
+	if providerAutoLogin(authProvider{ProviderType: "oauth2", Options: map[string]any{"auto_login": true}}) {
+		t.Fatal("prompt=none is an OIDC parameter; an OAuth2 provider cannot use it")
+	}
+	if !providerAutoLogin(authProvider{ProviderType: "oidc", Options: map[string]any{"auto_login": true}}) {
+		t.Fatal("expected auto_login on")
+	}
+}
+
 func TestValidateApprovalPolicyRejectsInvalidConditions(t *testing.T) {
 	valid := approvalPolicyInput{ResourceType: "talent_publish", Name: "고액 주문", Conditions: map[string]any{"min_amount": float64(100_000)}, Steps: []map[string]any{{"role": "operator", "min_approvals": float64(1)}}}
 	if !validateApprovalPolicy(&valid) {

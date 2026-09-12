@@ -164,6 +164,13 @@ Keycloak 앞에서 `Invalid parameter: redirect_uri` 오류가 발생하면 관�
 
 수동으로 GitHub에 push하거나 Release를 생성하지 않습니다. 배포 권한이 있는 사용자가 태그를 push할 때 자동화가 실행됩니다.
 
+## 가이드
+
+- 화면을 쓰는 사람: [`docs/USER_GUIDE.md`](./docs/USER_GUIDE.md) · [PDF](./docs/USER_GUIDE.pdf)
+- 설치하고 지키는 사람: [`docs/ADMIN_GUIDE.md`](./docs/ADMIN_GUIDE.md) · [PDF](./docs/ADMIN_GUIDE.pdf)
+
+두 문서의 화면 캡처는 `scripts/guide-screenshots.mjs` 가 버릴 수 있는 인스턴스에 가짜 데이터를 채우고 headless Chrome 으로 찍은 것입니다. 대상은 루프백 주소만 받고 자격 증명은 환경 변수로만 받습니다.
+
 ## API와 MCP
 
 - REST: `/api/v1`
@@ -627,6 +634,6 @@ internal/cryptox          AES-256-GCM과 토큰 다이제스트
 internal/password         Argon2id
 internal/ui               빌드된 React UI embed
 web                       React + TypeScript + MUI
-docs                      아키텍처와 API 계약
-scripts                   오프라인 이미지 생성·로딩
+docs                      사용자·관리자 가이드, 아키텍처와 API 계약
+scripts                   오프라인 이미지 생성·로딩, 가이드 화면 캡처
 ```

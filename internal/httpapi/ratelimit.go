@@ -21,6 +21,7 @@ var throttleDefaults = map[string]int{
 	"login":           10,
 	"talent_view":     120,
 	"inquiry_create":  20,
+	"csp_report":      60,
 }
 
 // allow is a fixed window counter shared by API key limits and per endpoint

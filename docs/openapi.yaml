@@ -1053,6 +1053,30 @@ paths:
       responses:
         '200': { description: decision recorded }
         '409': { $ref: '#/components/responses/Error' }
+  /analytics/csp-report:
+    post:
+      security: []
+      summary: 콘텐츠 보안 정책 위반 신고 수신
+      description: 방문 추적이 켜진 동안 브라우저가 정책에 막힌 출처를 보고하는 곳이다. 출처와 지시어만 메모리에 최대 100건 기억하며, 본문은 8KB로 제한한다. 항상 204를 돌려준다.
+      responses:
+        '204': { description: report accepted }
+  /admin/analytics/violations:
+    get:
+      summary: 정책에 막힌 출처 목록
+      description: 추적 스니펫이 불러오려다 막힌 출처를 지시어와 함께 보여 준다. 지금 설정이 이미 허용하는 출처는 allowed 로 표시된다.
+      responses:
+        '200': { description: blocked origins, most recent first }
+    delete:
+      summary: 막힌 출처 기록 비우기
+      responses:
+        '204': { description: records cleared }
+  /admin/analytics/violations/allow:
+    post:
+      summary: 막힌 출처를 허용 목록에 추가
+      description: analytics.tracking 의 allowed_hosts 에 출처 하나를 더하고 감사 기록을 남긴다.
+      responses:
+        '200': { description: updated allow list }
+        '400': { $ref: '#/components/responses/Error' }
   /admin/settings:
     get:
       summary: 중앙 운영 설정 목록

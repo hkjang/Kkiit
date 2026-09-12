@@ -31,10 +31,15 @@ paths:
     get:
       security: []
       summary: 소셜·OIDC 로그인 시작
-      description: 제공자의 인가 화면으로 리다이렉트한다. `link=1`이면 로그인 대신 현재 계정에 연결하는 흐름으로 진행한다.
+      description: |
+        제공자의 인가 화면으로 리다이렉트한다. `link=1`이면 로그인 대신 현재 계정에 연결하는 흐름으로 진행한다.
+        `prompt=none`은 제공자 세션이 있을 때만 화면 없이 로그인하는 조용한 시도이며, 그 제공자의 `auto_login` 옵션이 켜져 있을 때만 전달된다 — 꺼져 있으면 평범한 로그인으로 바뀐다.
+        `return_to`는 로그인 뒤 돌아갈 같은 출처의 경로로, `/`로 시작하고 `//`로 시작하지 않는 값만 받는다.
       parameters:
         - { name: slug, in: path, required: true, schema: { type: string } }
         - { name: link, in: query, schema: { type: string, enum: ['1'] } }
+        - { name: prompt, in: query, schema: { type: string, enum: ['none'] } }
+        - { name: return_to, in: query, schema: { type: string } }
       responses:
         '302': { description: redirect to the provider }
         '404': { $ref: '#/components/responses/Error' }
@@ -42,18 +47,23 @@ paths:
     get:
       security: []
       summary: 소셜·OIDC 로그인 콜백
-      description: 제공자가 돌려보낸 code와 state를 검증한다. state는 1회용이며 만료된다.
+      description: |
+        제공자가 돌려보낸 code와 state를 검증한다. state는 1회용이며 만료된다.
+        성공하면 시작할 때 받은 `return_to`로 돌아간다. 조용한 시도(`prompt=none`)가 `error=login_required`로 거절되면 실패가 아니라 세션이 없다는 대답이므로 `/login?sso=none`으로 보내고, 그 표시를 본 브라우저는 다시 시도하지 않는다.
       parameters:
         - { name: slug, in: path, required: true, schema: { type: string } }
         - { name: code, in: query, schema: { type: string } }
         - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
       responses:
         '302': { description: redirect back into the application }
         '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
   /auth/providers:
     get:
       security: []
       summary: 활성 로그인 제공자
+      description: 각 항목의 `auto_login`은 관리자가 그 제공자에 조용한 로그인(`prompt=none`)을 켰는지 알려 주며, 브라우저는 로그인 화면을 그리기 전에 이것을 보고 시도 여부를 정한다.
       responses:
         '200': { description: enabled providers }
   /auth/login:

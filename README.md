@@ -154,6 +154,8 @@ docker compose up -d
 
 완전 단절망에서는 로컬 로그인을 사용합니다. Google·Naver·Apple·Kakao는 해당 도메인에 접근 가능한 제한망에서만 사용할 수 있고, 내부 Keycloak은 Issuer URL과 Client 정보를 관리자 페이지에서 설정하면 됩니다.
 
+Keycloak 에 이미 로그인한 사람이 로그인 화면 없이 바로 들어오게 하려면 관리자 `인증 연동`에서 그 OIDC 제공자의 **자동 로그인**(`options.auto_login`, 기본 꺼짐)을 켭니다. 브라우저가 `prompt=none`으로 제공자에 한 번 다녀오고, 세션이 없으면 `/login?sso=none`으로 돌아와 다시 시도하지 않습니다. 자세한 동작은 [관리자 가이드](docs/ADMIN_GUIDE.md)의 3.3 절에 있습니다.
+
 Keycloak 앞에서 `Invalid parameter: redirect_uri` 오류가 발생하면 관리자 `인증 연동`에서 브라우저가 접속하는 **외부 서비스 주소**(예: `https://market.example.com`)를 저장합니다. 각 제공자 카드에 표시되는 전체 콜백 주소를 Keycloak Client의 **Valid redirect URIs**에 그대로 등록해야 합니다. Kkiit는 설정값을 우선 사용하고, 비어 있으면 표준 `Forwarded` 또는 `X-Forwarded-Proto`/`X-Forwarded-Host` 헤더를 반영합니다.
 
 ## GitHub Release

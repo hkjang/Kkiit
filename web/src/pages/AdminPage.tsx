@@ -25,6 +25,7 @@ import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded'
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded'
 import CancelRoundedIcon from '@mui/icons-material/CancelRounded'
 import InsightsOutlinedIcon from '@mui/icons-material/InsightsOutlined'
+import MailOutlineRoundedIcon from '@mui/icons-material/MailOutlineRounded'
 import { Brand } from '../components/Brand'
 import { api, dateTime } from '../api'
 import { AdminUserDetail } from './AdminUserDetail'
@@ -37,13 +38,14 @@ import { RiskQueue } from './RiskQueue'
 import { CouponsAdmin } from './CouponsAdmin'
 import { ReportQueue } from './ReportQueue'
 import { TrackingAdmin } from './TrackingAdmin'
+import { MailAdmin } from './MailAdmin'
 
 const drawerWidth = 274
 type AdminNavItem = readonly [label:string,path:string,icon:React.ReactNode,end?:boolean]
 const adminNav:ReadonlyArray<readonly [string,ReadonlyArray<AdminNavItem>]> = [
   ['운영', [['대시보드', '/admin', <DashboardRoundedIcon />, true], ['사용자', '/admin/users', <PeopleAltOutlinedIcon />], ['재능 상품', '/admin/talents', <StorefrontOutlinedIcon />], ['주문', '/admin/orders', <ReceiptLongOutlinedIcon />], ['승인 대기열', '/admin/approvals', <FactCheckOutlinedIcon />]]],
   ['거래', [['결제·정산', '/admin/finance', <AccountBalanceOutlinedIcon />], ['분쟁·위험', '/admin/risk', <GavelOutlinedIcon />], ['할인 쿠폰', '/admin/coupons', <LocalOfferOutlinedIcon />]]],
-  ['자동화', [['AI 설정', '/admin/ai', <PsychologyOutlinedIcon />], ['워크플로우', '/admin/workflow', <AltRouteRoundedIcon />], ['이벤트·알림', '/admin/events', <NotificationsActiveOutlinedIcon />]]],
+  ['자동화', [['AI 설정', '/admin/ai', <PsychologyOutlinedIcon />], ['워크플로우', '/admin/workflow', <AltRouteRoundedIcon />], ['이벤트·알림', '/admin/events', <NotificationsActiveOutlinedIcon />], ['메일 알림', '/admin/mail', <MailOutlineRoundedIcon />]]],
   ['시스템', [['기능 플래그', '/admin/features', <AltRouteRoundedIcon />], ['인증 연동', '/admin/auth', <KeyRoundedIcon />], ['역할·권한', '/admin/roles', <SecurityRoundedIcon />], ['감사 로그', '/admin/audit', <FactCheckOutlinedIcon />], ['방문 추적', '/admin/tracking', <InsightsOutlinedIcon />], ['전체 설정', '/admin/settings', <SettingsOutlinedIcon />]]],
 ]
 
@@ -78,6 +80,7 @@ export function AdminPage() {
         <Route path="roles" element={<RolesAdmin />} />
         <Route path="audit" element={<AuditAdmin />} />
         <Route path="tracking" element={<TrackingAdmin />} />
+        <Route path="mail" element={<MailAdmin />} />
         <Route path="settings" element={<SettingsAdmin />} />
         <Route path="*" element={<AdminPlaceholder />} />
       </Routes></Box>

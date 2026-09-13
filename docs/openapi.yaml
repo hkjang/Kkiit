@@ -1077,6 +1077,28 @@ paths:
       responses:
         '200': { description: updated allow list }
         '400': { $ref: '#/components/responses/Error' }
+  /admin/mail/deliveries:
+    get:
+      summary: 메일 발송 기록
+      description: 사내 SMTP 릴레이로 나간 알림 메일을 시도마다 보여 준다(언제·어떤 이벤트·누구에게·제목·상태·오류). 본문은 기록에 담지 않으며 돌려주지도 않는다.
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [queued, sending, retry, sent, failed] } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+      responses:
+        '200': { description: deliveries newest first with a per-status summary }
+  /admin/mail/test:
+    post:
+      summary: 시험 발송
+      description: 저장된 mail 설정으로 실제 한 통을 보내고 결과를 바로 돌려준다. 받는 사람을 비우면 요청한 관리자의 주소로 보낸다. 성공·실패 모두 발송 기록에 남는다.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { recipient: { type: string, format: email } } }
+      responses:
+        '200': { description: sent }
+        '400': { $ref: '#/components/responses/Error' }
+        '409': { description: mail.enabled is off }
+        '502': { description: the relay refused or could not be reached; the error message names the SMTP step }
   /admin/settings:
     get:
       summary: 중앙 운영 설정 목록

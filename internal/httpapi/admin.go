@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/hkjang/Kkiit/internal/analytics"
+	"github.com/hkjang/Kkiit/internal/mail"
 )
 
 func (s *Server) listSettings(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +97,19 @@ func (s *Server) putSetting(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := analytics.ReadConfig(value).Validate(); err != nil {
 			writeError(w, 400, "invalid_tracking", err.Error()+".")
+			return
+		}
+	}
+	// Relay details that can never connect are refused where the form is,
+	// with the field named, rather than found later as a failed row.
+	if key == mail.SettingKey {
+		value, ok := input.Value.(map[string]any)
+		if !ok {
+			writeError(w, 400, "invalid_value", "메일 설정 값을 확인해 주세요.")
+			return
+		}
+		if err := validateMailSetting(value); err != nil {
+			writeError(w, 400, "invalid_mail", err.Error()+".")
 			return
 		}
 	}
@@ -518,7 +532,7 @@ func (s *Server) listAuditLogs(w http.ResponseWriter, r *http.Request) {
 var unconnectedSettings = map[string]string{
 	"payment.credentials":      "결제 Adapter가 연결되면 사용합니다. 현재 결제는 manual 모드입니다.",
 	"storage.credentials":      "S3 호환 Storage Adapter가 연결되면 사용합니다. 현재 파일은 데이터베이스에 저장됩니다.",
-	"notification.credentials": "메일·SMS·Push 채널이 연결되면 사용합니다. 현재 알림은 웹 알림함과 웹훅으로만 전달됩니다.",
+	"notification.credentials": "SMS·Push 채널이 연결되면 사용합니다. 메일은 mail 설정(메일 알림 화면)에서 구성하며, 현재 알림은 웹 알림함·웹훅·메일로 전달됩니다.",
 	"agent.runtime":            "자율 Agent 실행 기능이 아직 없습니다.",
 	"observability.policy":     "OpenTelemetry 내보내기가 아직 없습니다. 요청 로그는 이 설정과 무관하게 항상 기록됩니다.",
 	"workflow.defaults":        "이벤트 재시도 한도는 notification.dispatch에서 읽습니다.",

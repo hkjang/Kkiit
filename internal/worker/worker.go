@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hkjang/Kkiit/internal/cryptox"
+	"github.com/hkjang/Kkiit/internal/mail"
 )
 
 type Worker struct {
@@ -38,6 +39,7 @@ type Worker struct {
 	lastRiskScan    time.Time
 	lastTrustScan   time.Time
 	lastMaintenance time.Time
+	lastMailSweep   time.Time
 }
 
 type policy struct {
@@ -62,6 +64,7 @@ type policy struct {
 	TrustBatch      int
 	TrustInterval   time.Duration
 	SellerLevels    []sellerLevel
+	Mail            mail.Config
 }
 
 func defaultPolicy() policy {
@@ -70,7 +73,8 @@ func defaultPolicy() policy {
 		Timeout: 10 * time.Second, AllowPrivate: true, WebChannel: true,
 		RiskEnabled: true, RiskBatch: 200, RiskInterval: 5 * time.Minute, Risk: defaultRiskThresholds(),
 		SettlementAuto: false, SettlementBatch: 100,
-		TrustEnabled: true, TrustBatch: 500, TrustInterval: 15 * time.Minute, SellerLevels: defaultSellerLevels()}
+		TrustEnabled: true, TrustBatch: 500, TrustInterval: 15 * time.Minute, SellerLevels: defaultSellerLevels(),
+		Mail: mail.ReadConfig(nil, "")}
 }
 
 type outboxEvent struct {
@@ -113,7 +117,8 @@ func (w *Worker) tick(ctx context.Context, current policy) bool {
 	w.periodicScans(ctx, current)
 	events := w.dispatchEvents(ctx, current)
 	deliveries := w.deliverWebhooks(ctx, current)
-	return events > 0 || deliveries > 0
+	mails := w.deliverMail(ctx, current)
+	return events > 0 || deliveries > 0 || mails > 0
 }
 
 // ScanNow runs the periodic analyses immediately and reports what changed. The
@@ -157,6 +162,15 @@ func (w *Worker) periodicScans(ctx context.Context, current policy) {
 			w.Logger.Info("trust scan updated scores", "sellers", sellers, "talents", talents)
 		}
 	}
+}
+
+// ReloadPolicy drops the cached settings so the next tick reads them again.
+// Tests use it; in production a change reaches the dispatcher within the
+// thirty second cache window.
+func (w *Worker) ReloadPolicy() {
+	w.policyMu.Lock()
+	defer w.policyMu.Unlock()
+	w.policyLoaded = time.Time{}
 }
 
 func (w *Worker) currentPolicy(ctx context.Context) policy {
@@ -212,6 +226,13 @@ func (w *Worker) currentPolicy(ctx context.Context) policy {
 		if levels := sellerLevelsSetting(grading); len(levels) > 0 {
 			result.SellerLevels = levels
 		}
+	}
+	// The relay password is decrypted here and lives only in this value. A
+	// row that cannot be read leaves mail off rather than half configured.
+	if config, err := mail.Load(ctx, w.DB, w.Box); err == nil {
+		result.Mail = config
+	} else {
+		w.Logger.Warn("mail setting was not read", "error", err)
 	}
 	w.policy, w.policyLoaded = result, time.Now()
 	return result
@@ -302,6 +323,9 @@ func (w *Worker) reclaimStuck(ctx context.Context, current policy) {
 	if _, err := w.DB.Exec(ctx, `UPDATE webhook_deliveries SET state='retry',next_attempt_at=now() WHERE state='sending' AND created_at < now()-make_interval(mins => $1)`, minutes); err != nil && ctx.Err() == nil {
 		w.Logger.Error("reclaim stuck deliveries failed", "error", err)
 	}
+	if _, err := w.DB.Exec(ctx, `UPDATE mail_deliveries SET status='retry',next_attempt_at=now() WHERE status='sending' AND updated_at < now()-make_interval(mins => $1)`, minutes); err != nil && ctx.Err() == nil {
+		w.Logger.Error("reclaim stuck mail failed", "error", err)
+	}
 }
 
 func (w *Worker) cleanup(ctx context.Context, current policy) {
@@ -312,6 +336,9 @@ func (w *Worker) cleanup(ctx context.Context, current policy) {
 	days := int(current.Retention / (24 * time.Hour))
 	if _, err := w.DB.Exec(ctx, `DELETE FROM domain_events WHERE status='done' AND processed_at < now()-make_interval(days => $1)`, days); err != nil && ctx.Err() == nil {
 		w.Logger.Error("event retention cleanup failed", "error", err)
+	}
+	if _, err := w.DB.Exec(ctx, `DELETE FROM mail_deliveries WHERE status IN ('sent','failed') AND created_at < now()-make_interval(days => $1)`, days); err != nil && ctx.Err() == nil {
+		w.Logger.Error("mail retention cleanup failed", "error", err)
 	}
 	// Credentials that can no longer authenticate anything are dead weight, and
 	// keeping them around only widens what a database copy exposes.
@@ -423,6 +450,9 @@ func (w *Worker) handleEvent(ctx context.Context, current policy, event outboxEv
 			return nil, err
 		}
 	}
+	if err := w.queueMail(ctx, tx, current, event, subject); err != nil {
+		return nil, err
+	}
 	if current.WebhookEnabled {
 		if err := w.queueDeliveries(ctx, tx, event); err != nil {
 			return nil, err
@@ -440,6 +470,10 @@ type subject struct {
 	Recipients []uuid.UUID
 	Variables  map[string]string
 	Link       string
+	// Buyer and Seller are the two sides of anything that has both, so a mail
+	// can be addressed to one side by role rather than by position.
+	Buyer  uuid.UUID
+	Seller uuid.UUID
 }
 
 func (w *Worker) resolveSubject(ctx context.Context, tx pgx.Tx, event outboxEvent) (subject, error) {
@@ -453,6 +487,7 @@ func (w *Worker) resolveSubject(ctx context.Context, tx pgx.Tx, event outboxEven
 			return result, fmt.Errorf("resolve order %s: %w", event.AggregateID, err)
 		}
 		result.Recipients = []uuid.UUID{buyer, seller}
+		result.Buyer, result.Seller = buyer, seller
 		result.Variables["order_number"] = number
 		result.Variables["talent_title"] = title
 		result.Link = "/orders/" + event.AggregateID.String()
@@ -475,6 +510,7 @@ func (w *Worker) resolveSubject(ctx context.Context, tx pgx.Tx, event outboxEven
 			return result, fmt.Errorf("resolve settlement %s: %w", event.AggregateID, err)
 		}
 		result.Recipients = []uuid.UUID{seller}
+		result.Seller = seller
 		result.Variables["order_number"] = number
 		result.Variables["net_amount"] = groupDigits(net)
 		// The hold template ends in "사유: {{hold_reason}}", and nothing was
@@ -498,6 +534,7 @@ func (w *Worker) resolveSubject(ctx context.Context, tx pgx.Tx, event outboxEven
 			return result, fmt.Errorf("resolve dispute %s: %w", event.AggregateID, err)
 		}
 		result.Recipients = []uuid.UUID{buyer, seller}
+		result.Buyer, result.Seller = buyer, seller
 		result.Variables["order_number"] = number
 		result.Variables["talent_title"] = title
 		result.Link = "/orders/" + orderID.String()
@@ -560,6 +597,7 @@ func (w *Worker) resolveSubject(ctx context.Context, tx pgx.Tx, event outboxEven
 			return result, fmt.Errorf("resolve rfq %s: %w", event.AggregateID, err)
 		}
 		result.Recipients = []uuid.UUID{buyer}
+		result.Buyer = buyer
 		result.Variables["rfq_title"] = title
 		result.Link = "/profile/projects"
 	case "quote":
@@ -572,6 +610,7 @@ func (w *Worker) resolveSubject(ctx context.Context, tx pgx.Tx, event outboxEven
 		// Both sides matter here: a new quote concerns the buyer, an accepted or
 		// rejected one concerns the seller. Actor exclusion picks the right one.
 		result.Recipients = []uuid.UUID{buyer, seller}
+		result.Buyer, result.Seller = buyer, seller
 		result.Variables["rfq_title"] = title
 		result.Link = "/profile/projects"
 	default:

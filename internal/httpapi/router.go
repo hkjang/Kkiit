@@ -1,10 +1,13 @@
 package httpapi
 
 import (
+	"bytes"
 	"io/fs"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/hkjang/Kkiit/internal/analytics"
 	"github.com/hkjang/Kkiit/internal/ui"
 )
 
@@ -114,6 +117,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/orders/{id}/disputes", s.require("", s.throttle("dispute_open", s.openDispute)))
 	mux.HandleFunc("POST /api/v1/orders/{id}/files", s.require("", s.uploadOrderFile))
 	mux.HandleFunc("GET /api/v1/files/{id}", s.downloadFile)
+	mux.HandleFunc("POST /api/v1/analytics/csp-report", s.throttle("csp_report", s.receiveCSPReport))
+	mux.HandleFunc("GET /api/v1/admin/analytics/violations", s.require("settings.read", s.listAnalyticsViolations))
+	mux.HandleFunc("DELETE /api/v1/admin/analytics/violations", s.require("settings.write", s.clearAnalyticsViolations))
+	mux.HandleFunc("POST /api/v1/admin/analytics/violations/allow", s.require("settings.write", s.allowAnalyticsHost))
 	mux.HandleFunc("GET /api/v1/admin/settings", s.require("settings.read", s.listSettings))
 	mux.HandleFunc("GET /api/v1/admin/dashboard", s.require("audit.read", s.adminDashboard))
 	mux.HandleFunc("GET /api/v1/admin/talents", s.require("talents.review", s.listAdminTalents))
@@ -171,18 +178,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /mcp", s.require("mcp.use", s.requireFeature("agent_marketplace", s.mcpPost)))
 	mux.HandleFunc("GET /mcp", s.mcpGet)
 	mux.HandleFunc("DELETE /mcp", s.mcpDelete)
-	mux.Handle("/", spaHandler())
+	mux.Handle(analytics.MomentoProxyPath+"/", s.momentoProxy())
+	mux.Handle("/", s.spaHandler())
 	return s.middleware(mux)
 }
 
-func spaHandler() http.Handler {
+func (s *Server) spaHandler() http.Handler {
 	assets, err := fs.Sub(ui.Files, "dist")
 	if err != nil {
 		return http.NotFoundHandler()
 	}
 	files := http.FileServer(http.FS(assets))
+	// The shell is read once: it is the file the tracking snippet is written
+	// into, per request, with that request's nonce.
+	shell, shellErr := fs.ReadFile(assets, "index.html")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/health/") || strings.HasPrefix(r.URL.Path, "/mcp") {
+		if isNonPagePath(r.URL.Path) {
 			http.NotFound(w, r)
 			return
 		}
@@ -213,6 +224,13 @@ func spaHandler() http.Handler {
 		// The application shell itself must not be cached, or a deploy is
 		// invisible to anyone whose browser still holds the old one.
 		w.Header().Set("Cache-Control", "no-cache")
+		if config := s.analyticsConfig(r.Context()); shellErr == nil && config.Active(r.URL.Path) {
+			if snippet := config.Snippet(requestNonce(r)); snippet != "" {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(injectSnippet(shell, snippet, config.Placement)))
+				return
+			}
+		}
 		r.URL.Path = "/"
 		files.ServeHTTP(w, r)
 	})

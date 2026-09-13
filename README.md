@@ -618,6 +618,12 @@ AI Agent 판매자는 MCP `list_settlements` 도구로 같은 정보를 조회�
 
 이 표에 없는 플래그는 제공하지 않습니다. 아무것도 바꾸지 않는 스위치는 없는 것보다 나쁘기 때문에, 구현되지 않은 기능의 플래그(`subscription`, `milestone_payment`)는 제거했습니다. 플래그는 지금까지 저장만 되고 어디서도 읽히지 않았습니다.
 
+## 방문 추적
+
+관리자 `시스템 → 방문 추적`에서 어떤 화면이 실제로 쓰이는지 재는 스크립트를 붙일 수 있습니다. **기본은 꺼짐**이며, 새로 설치한 곳에서는 켜기 전까지 페이지도 보안 정책도 달라지지 않습니다. 제공자는 사내 수집기 Momento가 첫 자리이고, 같은 오리진 프록시(`/momento/*`)를 기본으로 써서 방문 데이터가 밖으로 나가지 않고 정책에 외부 출처가 등장하지 않습니다.
+
+어려운 쪽은 `<script>` 삽입이 아니라 CSP입니다. 페이지는 `script-src 'self'`로 잠겨 있어 스니펫을 그냥 붙이면 브라우저가 조용히 버립니다. `'unsafe-inline'`으로 풀지 않고, 요청마다 nonce를 만들어 스니펫의 모든 `<script>`와 `script-src`에 같이 넣습니다. 스니펫에 적힌 http(s) 주소는 정책에 자동으로 더하고, 그래도 막힌 출처는 브라우저의 신고를 받아 관리 화면에 보여 주며 한 번 눌러 허용 목록에 넣을 수 있습니다. 끄면 정책은 원래 문자열로 돌아갑니다. 설정 항목과 CSP 설명은 [`docs/TRACKING.md`](./docs/TRACKING.md)에 있습니다.
+
 ## 승인 동작
 
 관리자가 `talent_publish` 승인 정책을 활성화하고 조건이 일치하면 상품 공개 요청은 `review_pending`과 승인 대기열로 이동합니다.
@@ -630,12 +636,13 @@ AI Agent 판매자는 MCP `list_settlements` 도구로 같은 정보를 조회�
 cmd/kkiit                 실행 진입점
 internal/database         마이그레이션과 부트스트랩
 internal/httpapi          REST, 인증, 관리자 API, MCP
+internal/analytics        방문 추적 스니펫·CSP 출처·차단 기록
 internal/worker           Outbox 디스패처, 알림 생성, 웹훅 전달
 internal/netguard         웹훅 대상 주소 정책
 internal/cryptox          AES-256-GCM과 토큰 다이제스트
 internal/password         Argon2id
 internal/ui               빌드된 React UI embed
 web                       React + TypeScript + MUI
-docs                      사용자·관리자 가이드, 아키텍처와 API 계약
+docs                      사용자·관리자 가이드, 아키텍처와 API 계약, 방문 추적 설정
 scripts                   오프라인 이미지 생성·로딩, 가이드 화면 캡처
 ```

@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/hkjang/Kkiit/internal/analytics"
 )
 
 func (s *Server) listSettings(w http.ResponseWriter, r *http.Request) {
@@ -83,6 +85,20 @@ func (s *Server) putSetting(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// The tracking setting is read on every page, so what cannot work is
+	// refused here rather than discovered as a blank tracker later. The
+	// snippet size limit applies even while tracking is off.
+	if key == analytics.SettingKey {
+		value, ok := input.Value.(map[string]any)
+		if !ok {
+			writeError(w, 400, "invalid_value", "방문 추적 설정 값을 확인해 주세요.")
+			return
+		}
+		if err := analytics.ReadConfig(value).Validate(); err != nil {
+			writeError(w, 400, "invalid_tracking", err.Error()+".")
+			return
+		}
+	}
 	valueJSON, err := json.Marshal(input.Value)
 	if err != nil {
 		writeError(w, 400, "invalid_value", "설정 값을 확인해 주세요.")
@@ -124,6 +140,9 @@ func (s *Server) putSetting(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, 500, "update_failed", "설정을 저장하지 못했습니다.")
 		return
+	}
+	if key == analytics.SettingKey {
+		s.invalidateAnalytics()
 	}
 	var before any
 	_ = json.Unmarshal(beforeRaw, &before)

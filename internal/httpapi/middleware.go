@@ -27,7 +27,10 @@ func (s *Server) csrf(next http.Handler) http.Handler {
 		safe := r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
 		_, cookieErr := r.Cookie("kkiit_session")
 		hasSessionCookie := cookieErr == nil
-		if safe || !hasSessionCookie {
+		// A policy violation report is posted by the browser itself, not by
+		// the page, and records nothing but an origin. It is let through so
+		// an administrator's own blocked snippet is the first one reported.
+		if safe || !hasSessionCookie || r.URL.Path == cspReportPath {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -132,7 +135,17 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+		if isNonPagePath(r.URL.Path) {
+			w.Header().Set("Content-Security-Policy", nonPagePolicy)
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Pages get a fresh nonce on every request. The policy names it and
+		// the page handler writes the same value into the tracking snippet,
+		// which is how inline tracking code runs without 'unsafe-inline'.
+		nonce := newNonce()
+		r = r.WithContext(context.WithValue(r.Context(), nonceKey{}, nonce))
+		w.Header().Set("Content-Security-Policy", pagePolicy(s.analyticsConfig(r.Context()), r.URL.Path, nonce))
 		next.ServeHTTP(w, r)
 	})
 }

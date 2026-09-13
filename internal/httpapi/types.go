@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/hkjang/Kkiit/internal/analytics"
 	"github.com/hkjang/Kkiit/internal/cryptox"
 )
 
@@ -32,9 +33,16 @@ type Server struct {
 	featureMu     sync.Mutex
 	featureCache  map[string]bool
 	featureLoaded time.Time
-	hubMu         sync.Mutex
-	topics        map[string]map[chan []byte]struct{}
-	draining      atomic.Bool
+	// analyticsCache holds the visitor tracking settings the page policy is
+	// built from, refreshed like the feature flags. violations remembers
+	// what browsers reported the policy blocked; it lives in memory only.
+	analyticsMu     sync.Mutex
+	analyticsCache  *analytics.Config
+	analyticsLoaded time.Time
+	violations      analytics.Recorder
+	hubMu           sync.Mutex
+	topics          map[string]map[chan []byte]struct{}
+	draining        atomic.Bool
 }
 
 type rateWindow struct {

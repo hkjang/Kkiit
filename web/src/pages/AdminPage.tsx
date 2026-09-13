@@ -24,6 +24,7 @@ import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded'
 import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded'
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded'
 import CancelRoundedIcon from '@mui/icons-material/CancelRounded'
+import InsightsOutlinedIcon from '@mui/icons-material/InsightsOutlined'
 import { Brand } from '../components/Brand'
 import { api, dateTime } from '../api'
 import { AdminUserDetail } from './AdminUserDetail'
@@ -35,6 +36,7 @@ import { DisputeQueue } from './DisputeQueue'
 import { RiskQueue } from './RiskQueue'
 import { CouponsAdmin } from './CouponsAdmin'
 import { ReportQueue } from './ReportQueue'
+import { TrackingAdmin } from './TrackingAdmin'
 
 const drawerWidth = 274
 type AdminNavItem = readonly [label:string,path:string,icon:React.ReactNode,end?:boolean]
@@ -42,7 +44,7 @@ const adminNav:ReadonlyArray<readonly [string,ReadonlyArray<AdminNavItem>]> = [
   ['운영', [['대시보드', '/admin', <DashboardRoundedIcon />, true], ['사용자', '/admin/users', <PeopleAltOutlinedIcon />], ['재능 상품', '/admin/talents', <StorefrontOutlinedIcon />], ['주문', '/admin/orders', <ReceiptLongOutlinedIcon />], ['승인 대기열', '/admin/approvals', <FactCheckOutlinedIcon />]]],
   ['거래', [['결제·정산', '/admin/finance', <AccountBalanceOutlinedIcon />], ['분쟁·위험', '/admin/risk', <GavelOutlinedIcon />], ['할인 쿠폰', '/admin/coupons', <LocalOfferOutlinedIcon />]]],
   ['자동화', [['AI 설정', '/admin/ai', <PsychologyOutlinedIcon />], ['워크플로우', '/admin/workflow', <AltRouteRoundedIcon />], ['이벤트·알림', '/admin/events', <NotificationsActiveOutlinedIcon />]]],
-  ['시스템', [['기능 플래그', '/admin/features', <AltRouteRoundedIcon />], ['인증 연동', '/admin/auth', <KeyRoundedIcon />], ['역할·권한', '/admin/roles', <SecurityRoundedIcon />], ['감사 로그', '/admin/audit', <FactCheckOutlinedIcon />], ['전체 설정', '/admin/settings', <SettingsOutlinedIcon />]]],
+  ['시스템', [['기능 플래그', '/admin/features', <AltRouteRoundedIcon />], ['인증 연동', '/admin/auth', <KeyRoundedIcon />], ['역할·권한', '/admin/roles', <SecurityRoundedIcon />], ['감사 로그', '/admin/audit', <FactCheckOutlinedIcon />], ['방문 추적', '/admin/tracking', <InsightsOutlinedIcon />], ['전체 설정', '/admin/settings', <SettingsOutlinedIcon />]]],
 ]
 
 export function AdminPage() {
@@ -75,6 +77,7 @@ export function AdminPage() {
         <Route path="auth" element={<AuthAdmin />} />
         <Route path="roles" element={<RolesAdmin />} />
         <Route path="audit" element={<AuditAdmin />} />
+        <Route path="tracking" element={<TrackingAdmin />} />
         <Route path="settings" element={<SettingsAdmin />} />
         <Route path="*" element={<AdminPlaceholder />} />
       </Routes></Box>
@@ -237,6 +240,7 @@ const settingLabels: Record<string, string> = {
   mode: '검색 방식', semantic_enabled: '의미 기반 검색', personalization_enabled: '개인화 검색',
   default_timeout_seconds: '기본 제한 시간(초)', max_retries: '최대 재시도', human_review_default: '사람 검토 기본 적용',
   otel_enabled: 'OpenTelemetry 사용', endpoint: '수집 주소', business_trace_enabled: '비즈니스 추적 사용',
+  momento_url: 'Momento 수집기 주소', momento_site_id: 'Momento 사이트 id', momento_proxy: '같은 오리진 프록시', measurement_id: '측정 id', matomo_url: 'Matomo 주소', matomo_site_id: 'Matomo 사이트 id', custom_snippet: '추적 코드', allowed_hosts: '추가 허용 출처', include_admin: '관리 화면에서도 추적', placement: '삽입 위치',
 }
 
 const fieldLabel = (path: string[]) => settingLabels[path[path.length - 1]] ?? path[path.length - 1].replaceAll('_', ' ')

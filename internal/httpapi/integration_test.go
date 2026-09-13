@@ -70,6 +70,7 @@ func integrationServer(t *testing.T) (*httptest.Server, *pgxpool.Pool) {
 	server := httptest.NewServer(api.Handler())
 	t.Cleanup(server.Close)
 	apiUnderTest = api
+	dispatcherUnderTest = dispatcher
 	return server, pool
 }
 
@@ -78,6 +79,10 @@ func integrationServer(t *testing.T) (*httptest.Server, *pgxpool.Pool) {
 // sequentially, so the last setup is the current one; a parallel test would
 // need to build its own server instead of reading this.
 var apiUnderTest *Server
+
+// dispatcherUnderTest is the outbox worker behind apiUnderTest, for the tests
+// that change a setting the worker caches.
+var dispatcherUnderTest *worker.Worker
 
 // grantRole promotes a freshly registered account. Operator accounts are
 // normally seeded by an administrator, which the HTTP surface does not expose.

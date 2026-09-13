@@ -121,6 +121,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/analytics/violations", s.require("settings.read", s.listAnalyticsViolations))
 	mux.HandleFunc("DELETE /api/v1/admin/analytics/violations", s.require("settings.write", s.clearAnalyticsViolations))
 	mux.HandleFunc("POST /api/v1/admin/analytics/violations/allow", s.require("settings.write", s.allowAnalyticsHost))
+	mux.HandleFunc("GET /api/v1/admin/mail/deliveries", s.require("settings.read", s.listMailDeliveries))
+	mux.HandleFunc("POST /api/v1/admin/mail/test", s.require("settings.write", s.sendTestMail))
 	mux.HandleFunc("GET /api/v1/admin/settings", s.require("settings.read", s.listSettings))
 	mux.HandleFunc("GET /api/v1/admin/dashboard", s.require("audit.read", s.adminDashboard))
 	mux.HandleFunc("GET /api/v1/admin/talents", s.require("talents.review", s.listAdminTalents))

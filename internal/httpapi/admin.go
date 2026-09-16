@@ -158,6 +158,9 @@ func (s *Server) putSetting(w http.ResponseWriter, r *http.Request) {
 	if key == analytics.SettingKey {
 		s.invalidateAnalytics()
 	}
+	if s.SettingSaved != nil {
+		s.SettingSaved(key)
+	}
 	var before any
 	_ = json.Unmarshal(beforeRaw, &before)
 	s.audit(r, "settings.update", "system_setting", key, before, input.Value, "success")

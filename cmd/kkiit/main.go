@@ -54,6 +54,7 @@ func main() {
 	api := &httpapi.Server{DB: pool, Box: box, Version: version, Commit: commit, BuiltAt: builtAt, Logger: logger}
 	dispatcher := &worker.Worker{DB: pool, Box: box, Logger: logger, Publish: api.PublishUser}
 	api.Rescan = dispatcher.ScanNow
+	api.SettingSaved = dispatcher.SettingSaved
 	dispatcher.Maintenance = api.RunOrderMaintenance
 	// The dispatcher claims events inside a transaction. Exiting without waiting
 	// for it leaves that work to the stuck-event sweeper on the next start,

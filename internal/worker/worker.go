@@ -165,12 +165,28 @@ func (w *Worker) periodicScans(ctx context.Context, current policy) {
 }
 
 // ReloadPolicy drops the cached settings so the next tick reads them again.
-// Tests use it; in production a change reaches the dispatcher within the
-// thirty second cache window.
+// Tests use it directly; the settings API reaches it through SettingSaved.
 func (w *Worker) ReloadPolicy() {
 	w.policyMu.Lock()
 	defer w.policyMu.Unlock()
 	w.policyLoaded = time.Time{}
+}
+
+// policyKeys are the system_settings rows currentPolicy reads. They are listed
+// here, next to the reader, so the settings API does not have to know them.
+var policyKeys = map[string]bool{
+	"notification.dispatch": true, "notification.webhook": true, "notification.channels": true,
+	"risk.policy": true, "settlement.policy": true, "seller.grading": true, mail.SettingKey: true,
+}
+
+// SettingSaved is what the settings API calls after writing a row. A change
+// to something the dispatcher reads takes effect on the next tick instead of
+// after the cache window, so a relay switched on and tested from the console
+// carries the very next event mail. Other keys cost nothing.
+func (w *Worker) SettingSaved(key string) {
+	if policyKeys[key] {
+		w.ReloadPolicy()
+	}
 }
 
 func (w *Worker) currentPolicy(ctx context.Context) policy {

@@ -27,7 +27,10 @@ type Server struct {
 	Logger  *slog.Logger
 	// Rescan triggers the background risk and settlement analyses on demand.
 	// It is nil when the process runs without a dispatcher.
-	Rescan        func(ctx context.Context) (risk int, settlements int)
+	Rescan func(ctx context.Context) (risk int, settlements int)
+	// SettingSaved tells the dispatcher a setting row was written so it can
+	// drop its cache when the row is one it reads. Nil without a dispatcher.
+	SettingSaved  func(key string)
 	rateMu        sync.Mutex
 	rate          map[string]rateWindow
 	featureMu     sync.Mutex

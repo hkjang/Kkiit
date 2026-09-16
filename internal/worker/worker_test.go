@@ -77,3 +77,21 @@ func TestParseUUIDValueRejectsNonUUIDPayloads(t *testing.T) {
 		t.Fatal("valid UUID must parse")
 	}
 }
+
+// The dispatcher caches its settings for thirty seconds. Saving one of them
+// from the console must not leave the operator waiting out that window, and
+// saving anything else must not throw the cache away for nothing.
+func TestSettingSavedDropsTheCacheOnlyForSettingsTheDispatcherReads(t *testing.T) {
+	for _, testCase := range []struct {
+		key      string
+		reloaded bool
+	}{{"mail", true}, {"notification.dispatch", true}, {"notification.webhook", true}, {"notification.channels", true},
+		{"risk.policy", true}, {"settlement.policy", true}, {"seller.grading", true},
+		{"analytics.tracking", false}, {"auth.security", false}, {"", false}} {
+		w := &Worker{policyLoaded: time.Now()}
+		w.SettingSaved(testCase.key)
+		if got := w.policyLoaded.IsZero(); got != testCase.reloaded {
+			t.Fatalf("SettingSaved(%q): cache dropped=%v want %v", testCase.key, got, testCase.reloaded)
+		}
+	}
+}

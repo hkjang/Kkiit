@@ -65,6 +65,7 @@ func integrationServer(t *testing.T) (*httptest.Server, *pgxpool.Pool) {
 	t.Cleanup(stop)
 	dispatcher := &worker.Worker{DB: pool, Box: box, Logger: logger, Publish: api.PublishUser}
 	api.Rescan = dispatcher.ScanNow
+	api.SettingSaved = dispatcher.SettingSaved
 	dispatcher.Maintenance = api.RunOrderMaintenance
 	go dispatcher.Run(dispatcherCtx)
 	server := httptest.NewServer(api.Handler())

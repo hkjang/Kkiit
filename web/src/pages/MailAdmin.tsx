@@ -75,7 +75,7 @@ export function MailAdmin() {
       if (password) body.secret = password
       await api(`/api/v1/admin/settings/${settingKey}`, { method: 'PUT', body: JSON.stringify(body) })
       setPassword('')
-      notify(form.enabled ? '메일 설정을 저장했습니다. 디스패처는 30초 안에 새 설정을 읽습니다.' : '메일 설정을 저장했습니다. 메일은 나가지 않습니다.', 'success')
+      notify(form.enabled ? '메일 설정을 저장했습니다. 다음 이벤트부터 새 설정으로 보냅니다.' : '메일 설정을 저장했습니다. 메일은 나가지 않습니다.', 'success')
       await load()
     } catch (cause) { notify(cause instanceof Error ? cause.message : '저장하지 못했습니다.', 'error') } finally { setSaving(false) }
   }

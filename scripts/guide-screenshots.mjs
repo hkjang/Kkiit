@@ -16,10 +16,13 @@
 //
 // It only ever creates new objects, and every step looks for what it made last
 // time before making it again, so a rerun against the same database adds
-// nothing. Nothing global is overwritten and no existing record is changed —
-// there is no prior state to restore. The one global it adds, an approval
-// policy, cannot be deleted once a request has gone through it (the server
-// refuses with policy_in_use), which is why it is looked up by name instead.
+// nothing but one mail delivery row (the test send it presses for the mail
+// screen). The two settings it saves, the mail relay and visitor tracking, are
+// saved with the same values every run and would have to be reset by hand on
+// a database somebody kept — another reason the target is loopback only. The
+// one global it adds, an approval policy, cannot be deleted once a request
+// has gone through it (the server refuses with policy_in_use), which is why
+// it is looked up by name instead.
 //
 //   POSTGRES_DSN=... BOOTSTRAP_ADMIN=admin@example.com BOOTSTRAP_ADMIN_PASSWORD=... \
 //     ENCRYPTION_KEY=... SHUTDOWN_DRAIN_SECONDS=0 ./bin/kkiit &
@@ -199,6 +202,32 @@ function talentPayload(spec, categoryID) {
 
 async function seed() {
   const admin = await new Session().login(adminUser, adminPassword)
+
+  // Mail goes first so the orders below leave delivery rows for the mail
+  // screen. The relay is a name that does not resolve: the screen is about the
+  // record every attempt leaves and the reason a relay gave, and a throwaway
+  // instance has no relay to deliver to. Saving is idempotent (no version, so
+  // no conflict) and a rerun changes nothing.
+  await admin.must('PUT', '/api/v1/admin/settings/mail', {
+    value: {
+      enabled: true, smtp_host: 'mail.corp.example', smtp_port: 25, security: 'auto', skip_tls_verify: false, username: '',
+      from_address: 'kkiit@corp.example', from_name: 'Kkiit', base_url: base, timeout_seconds: 5,
+      notify_order_paid: true, notify_order_delivered: true, notify_revision_requested: true, notify_quote: true, notify_dispute: true, notify_settlement_held: true,
+    },
+  })
+  // Visitor tracking, Momento through the same-origin proxy. The collector
+  // does not exist either; the browser asks Kkiit for /momento/tracker.js and
+  // gets a 502, which no page shows. One blocked origin is reported the way a
+  // browser would so the tracking screen has something to allow.
+  await admin.must('PUT', '/api/v1/admin/settings/analytics.tracking', {
+    value: {
+      enabled: true, provider: 'momento', momento_url: 'https://momento.corp.example', momento_site_id: 'kkiit-market', momento_proxy: true,
+      measurement_id: '', matomo_url: '', matomo_site_id: '', custom_snippet: '', allowed_hosts: '', include_admin: false, placement: 'head',
+    },
+  })
+  await admin.must('POST', '/api/v1/analytics/csp-report', {
+    'csp-report': { 'blocked-uri': 'https://static.corp.example/momento/plugins/heatmap.js', 'effective-directive': 'script-src', 'document-uri': `${base}/` },
+  })
 
   const categories = (await admin.must('GET', '/api/v1/categories')).items ?? []
   const categoryBySlug = new Map(categories.map((item) => [item.slug, item.id]))
@@ -530,6 +559,30 @@ class Page {
     await sleep(400)
   }
 
+  // Scrolls so the heading with exactly this text sits at the top of the
+  // viewport, the way a person scrolls to a section before reading it.
+  async scrollToText(text, tag = 'h2, h3, h4') {
+    const found = await this.evaluate(`(() => {
+      const el = [...document.querySelectorAll(${JSON.stringify(tag)})].find((node) => node.textContent.trim() === ${JSON.stringify(text)})
+      if (!el) return false
+      el.scrollIntoView({ block: 'start' }); window.scrollBy(0, -88); return true
+    })()`)
+    if (!found) throw new Error(`no heading with text ${text}`)
+    await sleep(400)
+  }
+
+  // Waits for the outcome of something the page does in the background, such
+  // as a test send, by watching for the text it shows when done.
+  async waitForText(selector, text, timeoutMs = 30000) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const found = await this.evaluate(`[...document.querySelectorAll(${JSON.stringify(selector)})].some((el) => el.textContent.includes(${JSON.stringify(text)}))`)
+      if (found) { await this.settle(); return }
+      await sleep(200)
+    }
+    throw new Error(`timed out waiting for ${JSON.stringify(text)} in ${selector}`)
+  }
+
   async shoot(name) {
     const { data } = await this.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
     const file = path.join(outputDir, `${name}.png`)
@@ -626,9 +679,31 @@ async function capture(seeded) {
     await page.goto('/admin/users')
     await page.clickText('김바다', 'h4')
     await page.shoot('admin-user-detail')
+
+    // Tracking: the form, then the blocked origin the seed reported.
+    await page.goto('/admin/tracking')
+    await page.shoot('admin-tracking')
+    await page.scrollToText('막힌 출처')
+    await page.shoot('admin-tracking-violations')
+
+    // Mail: the form, then a test send pressed for real. The relay does not
+    // exist, so the result is the failure an operator sees when the relay is
+    // wrong — the reason this button is on the screen. This is the one step
+    // that adds a row on every run: a test send is an attempt, and attempts
+    // are what the record below it keeps.
+    await page.goto('/admin/mail')
+    await page.shoot('admin-mail')
+    await page.clickText('시험 발송')
+    await page.waitForText('.MuiAlert-root', 'SMTP')
+    await page.scrollToText('시험 발송')
+    await page.shoot('admin-mail-deliveries')
   } finally {
     cdp.socket.close()
+    // Chrome keeps writing its profile for a moment after the signal; removing
+    // the directory underneath it fails with ENOTEMPTY, so the exit comes first.
+    const exited = new Promise((resolve) => chrome.child.once('exit', resolve))
     chrome.child.kill()
+    await Promise.race([exited, sleep(5000)])
     rmSync(chrome.profile, { recursive: true, force: true })
   }
 }

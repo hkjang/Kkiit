@@ -167,12 +167,25 @@ func (s *Server) authentication(next http.Handler) http.Handler {
 		var principal Principal
 		var found bool
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			var limited bool
-			principal, found, limited = s.authenticateAPIKey(r, strings.TrimSpace(strings.TrimPrefix(auth, "Bearer ")))
-			if limited {
-				w.Header().Set("Retry-After", "60")
-				writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "API 키의 분당 요청 한도를 초과했습니다.")
-				return
+			token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+			// One header, two kinds of credential. A key is a key wherever
+			// it is sent. A JWT is an SSO access token, and it opens the MCP
+			// endpoint only — see mcpoauth.go, which also says why when it
+			// refuses. Anywhere else it is what it always was: not a key.
+			if r.URL.Path == mcpPath && !strings.HasPrefix(token, "kkiit_") && looksLikeJWT(token) {
+				var refusal string
+				principal, found, refusal = s.authenticateMCPOAuth(r, token)
+				if refusal != "" {
+					r = r.WithContext(context.WithValue(r.Context(), mcpOAuthRefusalKey, refusal))
+				}
+			} else {
+				var limited bool
+				principal, found, limited = s.authenticateAPIKey(r, token)
+				if limited {
+					w.Header().Set("Retry-After", "60")
+					writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "API 키의 분당 요청 한도를 초과했습니다.")
+					return
+				}
 			}
 		} else if cookie, err := r.Cookie("kkiit_session"); err == nil {
 			principal, found = s.authenticateSession(r, cookie.Value)

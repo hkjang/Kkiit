@@ -75,24 +75,52 @@ func newFakeIssuer(t *testing.T) *fakeIssuer {
 // each test run signs in a distinct account.
 func (f *fakeIssuer) idToken(t *testing.T, audience, subject string) string {
 	t.Helper()
-	encode := func(value any) string {
-		raw, err := json.Marshal(value)
-		if err != nil {
-			t.Fatalf("encode claims: %v", err)
-		}
-		return base64.RawURLEncoding.EncodeToString(raw)
-	}
 	now := time.Now().Unix()
-	signingInput := encode(map[string]any{"alg": "RS256", "kid": "test", "typ": "JWT"}) + "." + encode(map[string]any{
+	return f.sign(t, map[string]any{"alg": "RS256", "kid": "test", "typ": "JWT"}, map[string]any{
 		"iss": f.server.URL, "sub": subject, "aud": audience, "exp": now + 300, "iat": now,
 		"email": subject + "@example.test", "email_verified": true, "name": "조용한 로그인",
 	})
+}
+
+// accessToken signs what a Keycloak 26 access token looks like: typ=Bearer in
+// the payload, the client in azp and only "account" in aud unless the caller
+// overrides claims — the shape the MCP audience check has to cope with.
+func (f *fakeIssuer) accessToken(t *testing.T, subject, clientID string, overrides map[string]any) string {
+	t.Helper()
+	now := time.Now().Unix()
+	claims := map[string]any{
+		"iss": f.server.URL, "sub": subject, "aud": "account", "azp": clientID, "typ": "Bearer",
+		"exp": now + 300, "iat": now, "nbf": 0, "preferred_username": subject, "scope": "openid email",
+	}
+	for key, value := range overrides {
+		if value == nil {
+			delete(claims, key)
+		} else {
+			claims[key] = value
+		}
+	}
+	return f.sign(t, map[string]any{"alg": "RS256", "kid": "test", "typ": "JWT"}, claims)
+}
+
+// sign produces a compact RS256 JWT with the issuer's key.
+func (f *fakeIssuer) sign(t *testing.T, header, claims map[string]any) string {
+	t.Helper()
+	signingInput := jwtEncode(t, header) + "." + jwtEncode(t, claims)
 	digest := sha256.Sum256([]byte(signingInput))
 	signature, err := rsa.SignPKCS1v15(rand.Reader, f.key, crypto.SHA256, digest[:])
 	if err != nil {
-		t.Fatalf("sign id token: %v", err)
+		t.Fatalf("sign token: %v", err)
 	}
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature)
+}
+
+func jwtEncode(t *testing.T, value any) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("encode claims: %v", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
 // browserClient keeps cookies like a browser but stops at redirects, so a test
@@ -138,7 +166,9 @@ func TestIntegrationSilentSsoNeverLoopsAndKeepsTheDeepLink(t *testing.T) {
 	}
 	created := admin.do(http.MethodPost, "/api/v1/admin/auth-providers", provider, http.StatusCreated)
 	providerID := fmt.Sprint(created["id"])
-	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM auth_providers WHERE id=$1::uuid`, providerID) })
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM auth_providers WHERE id=$1::uuid`, providerID)
+	})
 	start := "/api/v1/auth/oauth/" + slug + "/start"
 	callback := "/api/v1/auth/oauth/" + slug + "/callback"
 

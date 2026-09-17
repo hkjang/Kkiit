@@ -63,3 +63,27 @@ curl http://kkiit.internal:8080/mcp \
 7. 납품이 오면 `accept_delivery`로 구매확정하거나, `request_revision`으로 수정을 요청하거나, 해결되지 않으면 `open_dispute`로 분쟁을 접수합니다.
 
 `tools/list`는 항상 전체 목록을 반환하지만, 키 scope에 없는 도구를 호출하면 필요한 권한 이름과 함께 오류가 돌아옵니다.
+
+## 키 없이 SSO 로 연결
+
+관리자가 **인증 연동 → MCP 를 SSO 로 연결** 을 켠 배포에서는 키를 만들 필요가 없습니다. MCP
+클라이언트(Claude, Cursor 등)에 **MCP 주소 하나**(`https://<Kkiit 주소>/mcp`)만 넣으면 됩니다.
+클라이언트가 `401` 의 `WWW-Authenticate` 헤더가 가리키는 메타데이터
+(`/.well-known/oauth-protected-resource/mcp`)를 읽고 사내 SSO(Keycloak) 로그인 화면을 띄운 뒤,
+받아 온 액세스 토큰을 같은 `Authorization: Bearer` 헤더로 보냅니다. 이미 SSO 에 로그인돼 있으면
+화면을 거의 보지 않습니다.
+
+- **먼저 웹으로 한 번 로그인**해야 합니다. 토큰은 그 제공자로 로그인한 적 있는 활성 계정만 찾고,
+  계정을 만들지 않습니다. 없으면 `먼저 웹에서 … 으로 한 번 로그인하세요` 로 거부됩니다.
+- SSO 로 들어오면 쓸 수 있는 도구 범위는 관리자가 정한 권한(기본 `mcp.use`)과 내 역할의 교집합
+  입니다. `필요한 키 권한이 없습니다: orders.buy` 가 나오면 관리자에게 범위 확장을 요청하거나
+  그 권한을 가진 개인 API 키를 대신 씁니다.
+- 토큰은 `/mcp` 에서만 통합니다. REST API 는 여전히 키나 세션이 필요합니다.
+- 토큰 수명은 Keycloak 설정(보통 5분 안팎)을 따르고 클라이언트가 알아서 갱신합니다. Keycloak 에서
+  로그아웃해도 이미 받은 토큰은 만료까지 유효합니다.
+- 키는 그대로 됩니다. 폐쇄망이나 사람이 없는 자동화에서는 계속 `kkiit_…` 키를 쓰면 됩니다.
+
+```bash
+# 이 서버가 SSO 토큰을 받는지 확인 — 꺼져 있으면 404
+curl -s https://kkiit.internal/.well-known/oauth-protected-resource/mcp
+```

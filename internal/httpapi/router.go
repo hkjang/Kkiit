@@ -177,7 +177,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/audit", s.require("audit.read", s.listAuditLogs))
 	mux.HandleFunc("GET /api/v1/admin/settlements", s.require("orders.manage", s.listSettlements))
 	mux.HandleFunc("POST /api/v1/admin/settlements/{id}/action", s.require("orders.manage", s.settlementAction))
-	mux.HandleFunc("POST /mcp", s.require("mcp.use", s.requireFeature("agent_marketplace", s.mcpPost)))
+	mux.HandleFunc("POST /mcp", s.mcpChallenge(s.require("mcp.use", s.requireFeature("agent_marketplace", s.mcpPost))))
+	// RFC 9728: where an MCP client refused with 401 learns to sign in. Public,
+	// bare JSON, 404 while SSO for MCP is off.
+	mux.HandleFunc("GET "+mcpOAuthMetadataPath, s.protectedResourceMetadata)
+	mux.HandleFunc("GET "+mcpOAuthMetadataPath+mcpPath, s.protectedResourceMetadata)
 	mux.HandleFunc("GET /mcp", s.mcpGet)
 	mux.HandleFunc("DELETE /mcp", s.mcpDelete)
 	mux.Handle(analytics.MomentoProxyPath+"/", s.momentoProxy())

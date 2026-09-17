@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -46,6 +47,12 @@ type Server struct {
 	hubMu           sync.Mutex
 	topics          map[string]map[chan []byte]struct{}
 	draining        atomic.Bool
+	// mcpOAuthProviders caches OIDC discovery per issuer for the SSO tokens
+	// /mcp accepts; mcpOAuthLastReason keeps the "enabled but not in effect"
+	// warning to one line per reason.
+	mcpOAuthMu         sync.Mutex
+	mcpOAuthProviders  map[string]*oidc.Provider
+	mcpOAuthLastReason string
 }
 
 type rateWindow struct {
@@ -69,6 +76,9 @@ type contextKey string
 const (
 	principalKey contextKey = "principal"
 	requestIDKey contextKey = "requestID"
+	// mcpOAuthRefusalKey carries why a bearer token on /mcp was not accepted,
+	// so the 401 can say so instead of "sign in".
+	mcpOAuthRefusalKey contextKey = "mcpOAuthRefusal"
 )
 
 func principalFrom(ctx context.Context) (Principal, bool) {

@@ -4741,7 +4741,9 @@ func TestIntegrationDashboardCountsWorkThatCanBeOpened(t *testing.T) {
 	operator.do(http.MethodPost, "/api/v1/auth/logout", nil, http.StatusNoContent)
 	operator.do(http.MethodPost, "/api/v1/auth/login", map[string]any{"username": operatorName, "password": "IntegrationPass!23"}, http.StatusOK)
 
-	before := operator.do(http.MethodGet, "/api/v1/admin/dashboard", nil, http.StatusOK)["overdue_orders"].(float64)
+	initial := operator.do(http.MethodGet, "/api/v1/admin/dashboard", nil, http.StatusOK)
+	before := initial["overdue_orders"].(float64)
+	paidBefore := initial["gmv"].(float64)
 
 	seller, talentID, _ := sellTalent(t, server, "boardseller", uniqueName("대시보드 상품"), 60_000)
 	buyer := newClient(t, server.URL)
@@ -4754,6 +4756,16 @@ func TestIntegrationDashboardCountsWorkThatCanBeOpened(t *testing.T) {
 	after := operator.do(http.MethodGet, "/api/v1/admin/dashboard", nil, http.StatusOK)
 	if after["overdue_orders"].(float64) != before+1 {
 		t.Fatalf("납기 초과 집계=%v (이전 %v)", after["overdue_orders"], before)
+	}
+	// "누적 결제" summed a payment state the checkout never writes, so it read
+	// 0원 with money in escrow. It has to grow by exactly what the order case
+	// says was paid — the two screens read the same rows.
+	paid := operator.do(http.MethodGet, "/api/v1/admin/orders/"+orderID, nil, http.StatusOK)["money"].(map[string]any)["paid"].(float64)
+	if paid <= 0 {
+		t.Fatalf("결제 금액=%v", paid)
+	}
+	if after["gmv"].(float64) != paidBefore+paid {
+		t.Fatalf("누적 결제=%v (이전 %v, 결제 %v)", after["gmv"], paidBefore, paid)
 	}
 
 	// The number the board shows and the list its link opens have to be the

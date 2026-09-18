@@ -122,13 +122,13 @@ make test-integration KKIIT_TEST_DSN=postgres://user:pass@localhost:5432/kkiit_t
 
 산출 규칙:
 
-- 이미지: `kkiit:v0.4.1`
-- 파일: `release/kkiit-v0.4.1.tar.gz`
+- 이미지: `kkiit:v0.4.2`
+- 파일: `release/kkiit-v0.4.2.tar.gz`
 
 단절망으로 파일을 반입한 뒤 다음처럼 설치합니다. 조직의 반입 절차에서 생성한 checksum이 있다면 먼저 검증합니다.
 
 ```bash
-./scripts/load-offline.sh kkiit-v0.4.1.tar.gz
+./scripts/load-offline.sh kkiit-v0.4.2.tar.gz
 docker compose up -d
 ```
 

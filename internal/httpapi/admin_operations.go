@@ -21,7 +21,7 @@ func (s *Server) adminDashboard(w http.ResponseWriter, r *http.Request) {
 		(SELECT count(*) FROM talents WHERE status='published'),
 		(SELECT count(*) FROM approval_requests WHERE state='pending'),
 		(SELECT count(*) FROM orders WHERE state NOT IN ('COMPLETED','CANCELLED','REFUNDED')),
-		(SELECT COALESCE(sum(amount),0) FROM payments WHERE state='succeeded'),
+		(SELECT COALESCE(sum(amount),0) FROM payments WHERE state='captured'),
 		(SELECT COALESCE(sum(net_amount),0) FROM settlements WHERE state IN ('scheduled','confirmed')),
 		(SELECT count(*) FROM risk_scores WHERE level IN ('HIGH','CRITICAL')),
 		(SELECT count(*) FROM disputes WHERE state NOT IN ('resolved','closed')),

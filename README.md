@@ -177,10 +177,12 @@ Keycloak 앞에서 `Invalid parameter: redirect_uri` 오류가 발생하면 관�
 
 - REST: `/api/v1`
 - OpenAPI: 저장소의 [`docs/openapi.yaml`](./docs/openapi.yaml)
-- MCP: `POST /mcp`, protocol `2025-11-25`, Bearer API Key 필요
+- MCP: `POST /mcp`, protocol `2025-11-25`, Bearer API Key 필요(관리자가 켜면 Keycloak 액세스 토큰도 가능)
 - 상태: `/health/live`, `/health/ready`
 
 MCP 요청은 `Authorization: Bearer kkiit_...`와 `Accept: application/json, text/event-stream`을 포함해야 합니다. 현재 서버는 세션이 필요 없는 stateless JSON 응답 모드를 제공하며 GET 스트림에는 `405`를 반환합니다. 제공 도구는 19개입니다. 탐색은 `search_talents`, `recommend_talents`, `get_talent`, 견적은 `create_quote_request`, `compare_quotes`, 거래는 `preview_coupon`, `create_order`, `pay_order`, `list_orders`, `get_order_status`, `submit_requirement`, `send_message`, `submit_delivery`, `request_revision`, `accept_delivery`, 정산은 `list_settlements`, 사후 처리는 `list_notifications`, `open_dispute`, `submit_report`입니다.
+
+**SSO 로 연결**: 관리자가 **인증 연동 → MCP 를 SSO 로 연결**(`mcp.oauth`, 기본 꺼짐)을 켜면 `/mcp` 는 같은 `Authorization: Bearer` 헤더로 Keycloak 액세스 토큰도 받습니다. 서버는 RFC 9728 메타데이터(`/.well-known/oauth-protected-resource[/mcp]`)와 `WWW-Authenticate: Bearer resource_metadata=…` 401 로 길을 가리키므로 MCP 클라이언트에 주소 하나만 주면 스스로 로그인해 토큰을 받아 옵니다. 토큰은 서명·발급자·만료·`typ`·`cnf`·대상(`aud` 의 리소스 식별자 또는 허용 목록의 `aud`/`azp`)을 검사하고, 웹으로 로그인한 적 있는 활성 계정만 통과시키며 계정을 만들지 않습니다. 토큰은 `/mcp` 에서만 받고 REST 는 그대로 키와 세션만 받습니다. 설정 표와 Keycloak 매퍼 설정은 [관리자 가이드 3.3](./docs/ADMIN_GUIDE.md#33-인증-연동), 사용자 안내는 [`docs/mcp.md`](./docs/mcp.md#키-없이-sso-로-연결)을 보세요.
 
 Agent는 `pay_order`로 직접 결제까지 진행할 수 있으며 `idempotency_key`를 직접 만들어 보관해야 합니다. 재시도할 때 같은 값을 보내면 중복 결제 대신 `idempotent_replay`가 돌아옵니다. 상태 변화는 주문마다 폴링하지 않고 `list_notifications` 하나로 감지합니다. 자세한 흐름은 [`docs/mcp.md`](./docs/mcp.md)를 참고하세요.
 

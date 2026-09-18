@@ -122,6 +122,7 @@ curl -s http://127.0.0.1:8080/health/ready   # {"status":"ready"}
 | `notification.dispatch` | `poll_seconds: 2`, `event_batch: 50`, `event_retry_limit: 10`, `retention_days: 90` | 디스패처 주기·배치·재시도·보존 |
 | `notification.webhook` | `enabled: true`, `max_attempts: 6`, `timeout_seconds: 10`, `allow_private_targets: true` | 웹훅 전달과 내부망 대상 허용 |
 | `api.policy` | `default_rate_limit_per_minute: 60`, `mcp_enabled: true`, `throttle_per_minute: {}` | API 키 기본 한도, MCP, 엔드포인트별 분당 한도 덮어쓰기 |
+| `mcp.oauth` | `enabled: false`, `provider: ""`, `resource: ""`, `audience: []`, `scopes: ["mcp.use"]` | `/mcp` 를 Keycloak 액세스 토큰으로도 열기 — 3.3 의 "MCP 를 SSO 로 연결" |
 | `storage.policy` | `driver: database`, `max_upload_mb: 50` | 업로드 저장 위치와 크기 |
 | `ai.gateway` | `enabled: false`, `base_url`, `models`, `monthly_budget` | AI Gateway 연결과 월 예산 |
 
@@ -179,6 +180,97 @@ Keycloak 은 `prompt=none` 요청도 같은 콜백 주소로 돌려보내므로 
 **로그인 수단을 모두 없애는 변경은 서버가 거부합니다.** 활성 제공자가 없는데 로컬 로그인을 끄거나,
 로컬 로그인이 꺼진 채 마지막 제공자를 끄면 막힙니다. 소셜 계정은 이메일이 같다는 이유만으로
 기존 계정에 연결되지 않습니다.
+
+#### MCP 를 SSO 로 연결 (`mcp.oauth`)
+
+`/mcp` 는 개인 API 키(`kkiit_…`)로 들어옵니다. 이 카드를 켜면 **같은 `Authorization: Bearer` 헤더로
+Keycloak 이 발급한 액세스 토큰도** 받습니다. MCP 인가 규격(2025-06-18 이후)은 OAuth 2.1 이라 Claude·
+Cursor 같은 클라이언트에 MCP 주소 하나만 주면 클라이언트가 스스로 Keycloak 로그인 화면을 띄우고
+토큰을 받아 옵니다 — 사람이 키 페이지를 찾아 키를 만들고 붙여 넣는 일이 없어집니다. 키 체계는
+그대로 남으며, 키 없이 못 붙는 자동화 스크립트는 계속 키를 씁니다.
+
+Kkiit 는 **리소스 서버**입니다. 로그인과 토큰 발급은 Keycloak 이 하고, Kkiit 는 토큰을 받아 검사만
+합니다. `/authorize`·`/token`·동적 클라이언트 등록은 만들지 않으며 토큰을 저장하거나 세션으로
+바꾸지도 않습니다(요청마다 검사).
+
+**인증 연동** 화면의 **MCP 를 SSO 로 연결** 카드가 `mcp.oauth` 설정입니다.
+
+| 키 | 기본값 | 뜻 |
+|---|---|---|
+| `mcp.oauth.enabled` | `false` | **꺼짐이 기본.** 새로 설치했거나 켜기 전에는 아무것도 달라지지 않습니다 |
+| `mcp.oauth.provider` | `""` | 인증 서버로 쓸 OIDC 제공자의 식별자(slug). 비우면 Issuer URL 이 있는 **유일한** 활성 OIDC 제공자를 씁니다. 둘 이상이면 하나를 적어야 저장됩니다 |
+| `mcp.oauth.resource` | `""` | 리소스 식별자(RFC 8707) — 클라이언트가 실제로 접속하는 **공개 주소 + `/mcp`**. 비우면 **OAuth 외부 주소** + `/mcp`. 둘 다 비어 있으면 켤 수 없습니다(요청 `Host` 로 만든 값은 토큰의 `aud` 와 어긋나기 쉽고 누구나 헤더를 바꿀 수 있습니다) |
+| `mcp.oauth.audience` | `[]` | 허용 대상. 토큰의 `aud` **또는 `azp`** 가 이 목록에 있으면 통과. Audience 매퍼 없이 쓸 때 MCP 클라이언트 ID 를 적습니다 |
+| `mcp.oauth.scopes` | `["mcp.use"]` | SSO 로 들어온 사람에게 주는 **키 권한**(공백 구분도 됨). 그 계정의 역할 권한과의 **교집합**만 유효합니다. 토큰의 `scope`·`role` 은 읽지 않습니다 |
+| (재사용) 제공자의 Issuer URL·Client ID | 인증 제공자 행 | 새로 만들지 않습니다. `oidc.issuer_url` 에 해당하는 값은 그 제공자의 **Issuer URL** 입니다 |
+
+켜지는 조건은 셋이 다 있을 때입니다 — OIDC 제공자가 있고, 리소스 식별자를 만들 수 있고, `agent_marketplace`
+기능이 켜져 있어야 합니다. 저장 시점에 확인할 수 있는 것(제공자·주소)은 필드 이름과 함께 400 으로
+거부하고, 나중에 사라진 것(제공자를 껐거나 기능 플래그를 껐을 때)은 켜 두어도 조용히 꺼진 것처럼
+동작하며 로그에 `mcp oauth is enabled but not in effect` 와 이유를 한 번 남깁니다.
+
+토큰 검사 항목: 서명(Keycloak JWKS, RS·ES·PS 계열만 — `HS*`·`none` 거부), `iss`(제공자의 Issuer URL),
+`exp`·`nbf`, `typ`(`ID` 면 거부 — ID 토큰은 로그인 증거지 API 자격이 아닙니다), `cnf`(있으면 거부 —
+검증할 수 없는 소지자 증명), `sub`, 그리고 **대상**. 대상은 다음 중 하나가 맞아야 합니다.
+
+- `aud` 에 리소스 식별자(`https://…/mcp`)가 있다 — Keycloak 에 Audience 매퍼를 둔 정식 경로
+- `aud` 또는 `azp` 가 `mcp.oauth.audience` 에 있다 — 매퍼 없이 쓰는 호환 경로. 실제 Keycloak 26 은
+  `aud` 에 `account` 만 싣고 클라이언트 ID 는 `azp` 에 담으므로 MCP 클라이언트 ID 를 여기 적으면 됩니다
+
+**계정은 만들지 않습니다.** 토큰의 `sub` 로 그 제공자에 **이미 연결된 활성 계정**(`external_identities`)만
+찾습니다. 없으면 "먼저 웹에서 … 으로 한 번 로그인하세요" 로 거부합니다. 정지된 계정은 MCP 로
+되살아나지 않고, 토큰의 role 로 권한이 올라가지 않습니다. OAuth 로 들어온 사람은 **그 사용자가 키를
+만들어 들어왔을 때와 같은 문**(`mcp.use` 와 도구별 키 권한, 주문 소유권 검사)을 지납니다. 토큰은
+**`/mcp` 에서만** 받습니다 — REST·웹소켓·관리 API 는 지금처럼 키와 세션만 받습니다.
+
+**Keycloak 쪽 할 일**
+
+1. MCP 클라이언트용 **공개(public) 클라이언트**를 새로 만듭니다(예: `kkiit-mcp`). Standard Flow 켬,
+   PKCE `S256`, Direct Access Grants·Implicit·Service accounts 끔. 웹 로그인 클라이언트와 **다른**
+   클라이언트입니다.
+2. **Valid Redirect URIs** 에 쓰는 MCP 클라이언트의 콜백을 정확히 적습니다(Claude 는
+   `https://claude.ai/api/mcp/auth_callback`, 로컬 클라이언트는 `http://127.0.0.1:*/callback` 류).
+   `*` 하나로 다 여는 것은 금지입니다.
+3. 정식 경로: 그 클라이언트(또는 전용 client scope)에 **Audience 매퍼** — Mapper type `Audience`,
+   Included Custom Audience = 리소스 식별자(`https://market.example.com/mcp`), Add to access token
+   **ON**, Add to ID token **OFF**. 호환 경로: 매퍼 없이 Kkiit 의 `mcp.oauth.audience` 에 클라이언트
+   ID(`kkiit-mcp`)를 적습니다.
+4. 액세스 토큰 수명은 짧게(5분 안팎). Kkiit 는 introspection 을 하지 않으므로 **Keycloak 에서
+   로그아웃하거나 사용자를 껐어도 이미 발급된 토큰은 만료까지 삽니다.** 즉시 막아야 하면 Kkiit 의
+   **사용자 → 정지**(다음 요청부터 거부) 또는 이 카드의 스위치를 씁니다.
+
+**확인 방법**
+
+```bash
+# 메타데이터(RFC 9728) — 인증 없이 맨 JSON. 꺼져 있으면 404
+curl -s https://market.example.com/.well-known/oauth-protected-resource/mcp
+# {"resource":"https://market.example.com/mcp","authorization_servers":["https://sso.example.com/realms/corp"],
+#  "bearer_methods_supported":["header"],"scopes_supported":["mcp.use"],"resource_name":"Kkiit Marketplace MCP"}
+
+# 토큰 없는 /mcp — 401 과 함께 길을 가리키는 헤더. REST 401 에는 이 헤더가 없습니다
+curl -si https://market.example.com/mcp -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | grep -i www-authenticate
+# WWW-Authenticate: Bearer realm="Kkiit", resource_metadata="https://market.example.com/.well-known/oauth-protected-resource/mcp"
+
+# Keycloak 에서 받은 액세스 토큰으로 도구 목록
+curl -s https://market.example.com/mcp -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  --data '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+**거부 메시지별 조치** — 거부는 모두 `401` `invalid_token` 이고 헤더에 `error="invalid_token"` 이 붙습니다.
+
+| 메시지 | 뜻 | 조치 |
+|---|---|---|
+| `SSO 토큰이 이 서버를 위해 발급된 것이 아닙니다(aud [account], azp "kkiit-mcp"). …` | 대상 검사 실패. 다른 앱용 토큰이거나 매퍼·허용 대상이 없음 | 메시지의 `azp` 값을 **허용 대상**에 더하거나, Keycloak 클라이언트에 메시지의 리소스 식별자로 Audience 매퍼 추가 |
+| `이 SSO 계정은 Kkiit 에 등록되지 않았거나 비활성입니다. 먼저 웹에서 … 으로 한 번 로그인하세요.` | 그 제공자로 웹 로그인한 적이 없거나 계정이 정지됨 | 사용자가 브라우저에서 그 제공자 버튼으로 로그인. 정지 계정이면 **사용자** 에서 상태 확인 |
+| `SSO 액세스 토큰이 만료되었습니다.` | `exp` 지남 | 클라이언트에서 다시 로그인(대부분 자동) |
+| `SSO 액세스 토큰이 유효하지 않습니다(서명·발급자·유효 기간).` | 다른 realm 의 토큰, 서명 불일치, `HS*`, `nbf` 미래 | 클라이언트가 이 서버의 메타데이터가 가리키는 realm 으로 로그인했는지, 제공자의 Issuer URL 이 정확한지, 서버 시각 확인 |
+| `ID 토큰은 MCP 자격이 아닙니다.` | 클라이언트가 `id_token` 을 보냄 | 액세스 토큰을 보내도록 클라이언트 설정 |
+| `소지자 증명(cnf)이 묶인 토큰은 …` | DPoP·mTLS 바인딩 토큰 | Keycloak 클라이언트에서 DPoP 를 끄거나 일반 Bearer 로 발급 |
+| `Keycloak 발급자 정보를 읽지 못해 …` | Kkiit 에서 discovery/JWKS 에 닿지 못함 | 로그 `mcp oauth discovery failed` 의 오류, 방화벽·DNS·내부 CA. IdP 요청은 분당 30회로 제한됩니다 |
+| `필요한 키 권한이 없습니다: orders.buy` (도구 호출 결과) | 401 이 아니라 도구 오류. `mcp.oauth.scopes` 나 계정 역할에 그 권한이 없음 | **허용 범위**에 권한을 더하거나 사용자의 역할 확인 |
+| 401 인데 메시지가 `로그인이 필요합니다.` 이고 헤더가 없음 | SSO 연결이 꺼져 있거나 조건 미충족 | 카드 스위치와 로그 `mcp oauth is enabled but not in effect` 확인 |
 
 ### 3.4 메일 알림
 
@@ -497,6 +589,7 @@ docker compose logs -f kkiit         # "migration failed" 가 없고 "Kkiit star
 | 로그인 화면에서 `요청 출처를 확인할 수 없습니다.` / `교차 사이트 요청이 차단되었습니다.` | 리버스 프록시 | 서버는 `Origin` 호스트와 요청 `Host` 가 같아야 받습니다. 프록시가 원래 `Host` 헤더를 그대로 넘기게 합니다 |
 | 소셜 로그인 뒤 `인증 요청이 만료되었거나 이미 사용되었습니다.` | **인증 연동 → OAuth 외부 주소**, 제공자 콜백 등록 | 외부 주소와 콜백 URL 이 일치하는지 확인. 한 번 쓴 인증 요청은 재사용되지 않습니다 |
 | SSO 에 로그인돼 있는데 Kkiit 가 로그인 화면을 보여 줌 | **인증 연동 → 제공자 편집 → 자동 로그인** | 그 제공자의 `auto_login` 이 켜져 있는지, 사용자가 직접 로그아웃한 탭이 아닌지(새 탭에서 다시 시도) 확인. 주소에 `?sso=none` 이 있으면 제공자가 세션 없음으로 답한 것입니다 |
+| MCP 클라이언트가 로그인 루프에 빠지거나 `SSO 토큰이 이 서버를 위해 발급된 것이 아닙니다` | **인증 연동 → MCP 를 SSO 로 연결**, Keycloak 클라이언트 | 3.3 의 거부 메시지 표. 메시지의 `azp` 를 허용 대상에 더하거나 Audience 매퍼 추가. 메타데이터의 `resource` 와 클라이언트가 접속하는 주소가 같은지 확인 |
 | 관리자가 로그인 못 함 `mfa_enrollment_required` | `auth.security.mfa_admin_required` | 다른 관리자가 **전체 설정** 에서 잠시 끄거나, 해당 계정에 TOTP 를 먼저 등록 |
 | 관리자가 인증 앱을 잃음 | **사용자 → 편집 → MFA 초기화** | 다른 관리자가 초기화. 단일 관리자라면 DB 에서 그 계정의 `mfa_factors` 행 삭제가 마지막 수단 |
 | 알림·웹훅이 오지 않음 | **이벤트·알림**, 로그 `webhook delivery failed` | 실패 건을 **재처리**. `notification.webhook.allow_private_targets`, 대상 서버 응답 확인 |

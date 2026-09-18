@@ -113,6 +113,20 @@ func (s *Server) putSetting(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A switch that could not take effect — no OIDC provider, no address to
+	// name the resource by — is refused here with the reason, not left on and
+	// silently ignored.
+	if key == mcpOAuthSettingKey {
+		value, ok := input.Value.(map[string]any)
+		if !ok {
+			writeError(w, 400, "invalid_value", "MCP SSO 설정 값을 확인해 주세요.")
+			return
+		}
+		if err := s.validateMCPOAuthSetting(r.Context(), value); err != nil {
+			writeError(w, 400, "invalid_mcp_oauth", err.Error()+".")
+			return
+		}
+	}
 	valueJSON, err := json.Marshal(input.Value)
 	if err != nil {
 		writeError(w, 400, "invalid_value", "설정 값을 확인해 주세요.")

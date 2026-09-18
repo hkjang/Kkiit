@@ -40,7 +40,7 @@ func requestNonce(r *http.Request) string {
 // MCP and the collector proxy. These carry a policy that allows nothing at
 // all, and the tracking snippet is never injected into them.
 func isNonPagePath(path string) bool {
-	return strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/health/") || strings.HasPrefix(path, "/mcp") || path == analytics.MomentoProxyPath || strings.HasPrefix(path, analytics.MomentoProxyPath+"/")
+	return strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/health/") || strings.HasPrefix(path, "/mcp") || strings.HasPrefix(path, "/.well-known/") || path == analytics.MomentoProxyPath || strings.HasPrefix(path, analytics.MomentoProxyPath+"/")
 }
 
 // analyticsConfig reads the tracking settings. Failures are treated as "no

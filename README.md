@@ -100,7 +100,7 @@ go run -ldflags "-X main.version=$(cat VERSION)" ./cmd/kkiit
 
 브라우저에서 `http://localhost:8080`을 엽니다. 앱 시작 시 마이그레이션을 advisory lock 안에서 자동 적용하고 부트스트랩 관리자를 보장합니다.
 
-검증:
+검증(gofmt · go test · go vet · 웹 lint/테스트/빌드 순서로, 포맷이 어긋난 Go 파일이 있으면 첫 줄에서 멈춥니다):
 
 ```bash
 make check

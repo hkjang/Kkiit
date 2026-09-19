@@ -31,6 +31,7 @@ release: docker
 	docker save $(IMAGE) | gzip -9 > release/kkiit-v$(VERSION).tar.gz
 
 check:
+	@unformatted="$$(gofmt -l cmd internal)"; if [ -n "$$unformatted" ]; then echo "gofmt 가 필요한 파일:"; echo "$$unformatted"; exit 1; fi
 	go test $(GO_PACKAGES)
 	go vet $(GO_PACKAGES)
 	cd web && npm ci --ignore-scripts && npm run lint && npm test && npm run build

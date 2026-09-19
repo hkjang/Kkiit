@@ -138,7 +138,9 @@ func TestIntegrationSilentSsoNeverLoopsAndKeepsTheDeepLink(t *testing.T) {
 	}
 	created := admin.do(http.MethodPost, "/api/v1/admin/auth-providers", provider, http.StatusCreated)
 	providerID := fmt.Sprint(created["id"])
-	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM auth_providers WHERE id=$1::uuid`, providerID) })
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM auth_providers WHERE id=$1::uuid`, providerID)
+	})
 	start := "/api/v1/auth/oauth/" + slug + "/start"
 	callback := "/api/v1/auth/oauth/" + slug + "/callback"
 

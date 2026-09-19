@@ -12,6 +12,7 @@ import (
 
 	"github.com/hkjang/Kkiit/internal/analytics"
 	"github.com/hkjang/Kkiit/internal/cryptox"
+	"github.com/hkjang/Kkiit/internal/netguard"
 )
 
 // cspReportPath is where browsers post the requests the content security
@@ -214,11 +215,24 @@ func (s *Server) allowAnalyticsHost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"allowed_hosts": values["allowed_hosts"]})
 }
 
+// momentoProxyTimeout bounds how long a collector may take to answer; the
+// browser's tracking calls are fire-and-forget, so a silent collector should
+// cost a quick 502 rather than a handler held open until the write timeout.
+var momentoProxyTimeout = 10 * time.Second
+
+// momentoProxyStripped are response headers that must come from this server,
+// never from the collector: cookies would land on this origin, and the rest
+// would sit next to (or loosen) the policy securityHeaders already set.
+var momentoProxyStripped = []string{"Set-Cookie", "Content-Security-Policy", "Content-Security-Policy-Report-Only", "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy", "Strict-Transport-Security"}
+
 // momentoProxy forwards collector traffic to the configured Momento address
 // so the browser only ever talks to this origin. It is closed unless Momento
 // is the active provider with the proxy turned on, and it forwards without
 // the visitor's cookies: the collector has no business with the session.
 func (s *Server) momentoProxy() http.Handler {
+	// Momento is usually an internal host, so private destinations stay
+	// allowed; the guard is only borrowed for its dial and header timeouts.
+	transport := netguard.Client(momentoProxyTimeout, true).Transport
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		config := s.analyticsConfig(r.Context())
 		if !config.ProxyActive() {
@@ -231,6 +245,7 @@ func (s *Server) momentoProxy() http.Handler {
 			return
 		}
 		proxy := &httputil.ReverseProxy{
+			Transport: transport,
 			Rewrite: func(request *httputil.ProxyRequest) {
 				request.SetURL(target)
 				request.Out.URL.Path = strings.TrimRight(target.Path, "/") + strings.TrimPrefix(r.URL.Path, analytics.MomentoProxyPath)
@@ -239,6 +254,12 @@ func (s *Server) momentoProxy() http.Handler {
 				request.Out.Header.Del("Cookie")
 				request.Out.Header.Del("Authorization")
 				request.SetXForwarded()
+			},
+			ModifyResponse: func(response *http.Response) error {
+				for _, header := range momentoProxyStripped {
+					response.Header.Del(header)
+				}
+				return nil
 			},
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 				s.Logger.Warn("momento proxy failed", "error", err, "path", r.URL.Path, "request_id", requestIDFrom(r.Context()))

@@ -179,6 +179,69 @@ func TestMomentoProxyForwardsWithoutCookies(t *testing.T) {
 	}
 }
 
+func TestMomentoProxyDropsUpstreamCookiesAndSecurityHeaders(t *testing.T) {
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A collector that tries to set state on our origin or to loosen the
+		// browser policy this origin ships must not get through.
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Set-Cookie", "_mtm_id=visitor; Path=/")
+		w.Header().Set("Content-Security-Policy", "default-src *")
+		w.Header().Set("X-Frame-Options", "ALLOWALL")
+		w.Header().Set("Referrer-Policy", "unsafe-url")
+		w.Header().Set("Strict-Transport-Security", "max-age=0")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write([]byte("// tracker"))
+	}))
+	defer collector.Close()
+	config := analytics.Config{Enabled: true, Provider: analytics.ProviderMomento, MomentoURL: collector.URL, MomentoSiteID: "kkiit", MomentoProxy: true, Placement: "head"}
+	recorder := get(t, trackingServer(config).Handler(), "/momento/tracker.js")
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "// tracker" {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("수집기의 Set-Cookie 가 이 출처로 새어 나왔습니다: %v", got)
+	}
+	for header, want := range map[string]string{"Content-Security-Policy": nonPagePolicy, "X-Frame-Options": "DENY", "Referrer-Policy": "strict-origin-when-cross-origin"} {
+		if got := recorder.Header().Values(header); len(got) != 1 || got[0] != want {
+			t.Fatalf("%s 가 이 서버의 값 하나여야 하는데 %v 입니다", header, got)
+		}
+	}
+	if got := recorder.Header().Values("Strict-Transport-Security"); len(got) != 0 {
+		t.Fatalf("수집기의 Strict-Transport-Security 가 새어 나왔습니다: %v", got)
+	}
+	// Ordinary response headers still pass so the tracker script can be cached.
+	if got := recorder.Header().Get("Cache-Control"); got != "public, max-age=3600" {
+		t.Fatalf("수집기의 Cache-Control 이 사라졌습니다: %q", got)
+	}
+}
+
+func TestMomentoProxyGivesUpOnASilentCollector(t *testing.T) {
+	release := make(chan struct{})
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer collector.Close()
+	defer close(release)
+	// The transport is built when the handler is, so the shorter wait must be
+	// in place before Handler() runs.
+	previous := momentoProxyTimeout
+	momentoProxyTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { momentoProxyTimeout = previous })
+	config := analytics.Config{Enabled: true, Provider: analytics.ProviderMomento, MomentoURL: collector.URL, MomentoSiteID: "kkiit", MomentoProxy: true, Placement: "head"}
+	handler := trackingServer(config).Handler()
+	started := time.Now()
+	recorder := get(t, handler, "/momento/collect")
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("응답 없는 수집기에 status=%d", recorder.Code)
+	}
+	if elapsed := time.Since(started); elapsed < momentoProxyTimeout || elapsed > 5*time.Second {
+		t.Fatalf("프록시가 %s 만에 포기했습니다(기대 약 %s)", elapsed, momentoProxyTimeout)
+	}
+}
+
 func TestCSPReportIsRecordedOnceAndAlwaysAnswered(t *testing.T) {
 	server := &Server{}
 	body := `{"csp-report":{"blocked-uri":"https://momento.corp.example/collect/v1/events","effective-directive":"connect-src","document-uri":"https://kkiit.example/talents/1"}}`

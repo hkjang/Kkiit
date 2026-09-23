@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -46,17 +47,20 @@ func (s *Server) listApprovalPolicies(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": items, "bypass_when_no_policy": true})
 }
 
-func validateApprovalPolicy(in *approvalPolicyInput) bool {
+// validateApprovalPolicy normalises the input and reports why it cannot be
+// stored, so the caller can tell the administrator which field to correct
+// instead of repeating one unhelpful sentence.
+func validateApprovalPolicy(in *approvalPolicyInput) (string, bool) {
 	in.ResourceType = strings.TrimSpace(in.ResourceType)
 	in.Name = strings.TrimSpace(in.Name)
 	if in.ResourceType == "" || in.Name == "" {
-		return false
+		return "대상 종류와 이름을 입력해 주세요.", false
 	}
 	if in.Priority == 0 {
 		in.Priority = 100
 	}
 	if in.Priority < 1 {
-		return false
+		return "우선순위는 1 이상이어야 합니다.", false
 	}
 	if in.Conditions == nil {
 		in.Conditions = map[string]any{}
@@ -65,14 +69,22 @@ func validateApprovalPolicy(in *approvalPolicyInput) bool {
 		if raw, exists := in.Conditions[key]; exists {
 			value, ok := numericValue(raw)
 			if !ok || value < 0 || math.IsInf(value, 0) || math.IsNaN(value) {
-				return false
+				return key + "은(는) 0 이상의 숫자여야 합니다.", false
 			}
 		}
 	}
 	minimum, hasMinimum := numericValue(in.Conditions["min_amount"])
 	maximum, hasMaximum := numericValue(in.Conditions["max_amount"])
 	if hasMinimum && hasMaximum && minimum > maximum {
-		return false
+		return "min_amount는 max_amount보다 클 수 없습니다.", false
+	}
+	// The matcher reads these two with a []any type assertion and skips the
+	// condition when it fails, which would silently widen the policy to every
+	// product. Refusing the value here keeps the stored policy readable.
+	for _, key := range []string{"service_types", "seller_levels"} {
+		if reason, ok := validateStringListCondition(in.Conditions, key); !ok {
+			return reason, false
+		}
 	}
 	if len(in.Steps) == 0 {
 		in.Steps = []map[string]any{{"role": "operator", "min_approvals": 1}}
@@ -81,10 +93,45 @@ func validateApprovalPolicy(in *approvalPolicyInput) bool {
 		role, roleOK := step["role"].(string)
 		approvals, approvalsOK := numericValue(step["min_approvals"])
 		if !roleOK || strings.TrimSpace(role) == "" || !approvalsOK || approvals < 1 || approvals != math.Trunc(approvals) {
-			return false
+			return "각 단계에는 역할과 1 이상의 정수 승인 수가 필요합니다.", false
 		}
 	}
-	return true
+	return "", true
+}
+
+// validateStringListCondition accepts an absent key and an empty list, because
+// the matcher only applies the condition when it holds at least one value and
+// existing policies rely on that.
+func validateStringListCondition(conditions map[string]any, key string) (string, bool) {
+	raw, exists := conditions[key]
+	if !exists {
+		return "", true
+	}
+	values, ok := raw.([]any)
+	if !ok {
+		return key + "은(는) 문자열 배열이어야 합니다.", false
+	}
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok || strings.TrimSpace(text) == "" {
+			return key + "의 값은 비어 있지 않은 문자열이어야 합니다.", false
+		}
+	}
+	return "", true
+}
+
+// storedPolicyConditions reads the conditions column as it stands now, so an
+// update that leaves them alone can be told apart from one that changes them.
+func (s *Server) storedPolicyConditions(r *http.Request, id uuid.UUID) (map[string]any, bool) {
+	var raw []byte
+	if err := s.DB.QueryRow(r.Context(), `SELECT conditions FROM approval_policies WHERE id=$1`, id).Scan(&raw); err != nil {
+		return nil, false
+	}
+	stored := map[string]any{}
+	if json.Unmarshal(raw, &stored) != nil {
+		return nil, false
+	}
+	return stored, true
 }
 
 func numericValue(value any) (float64, bool) {
@@ -132,8 +179,8 @@ func (s *Server) createApprovalPolicy(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in) {
 		return
 	}
-	if !validateApprovalPolicy(&in) {
-		writeError(w, 400, "invalid_policy", "승인 정책을 확인해 주세요.")
+	if reason, ok := validateApprovalPolicy(&in); !ok {
+		writeError(w, 400, "invalid_policy", "승인 정책을 확인해 주세요. "+reason)
 		return
 	}
 	p, _ := principalFrom(r.Context())
@@ -156,8 +203,25 @@ func (s *Server) updateApprovalPolicy(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in) {
 		return
 	}
-	if !validateApprovalPolicy(&in) {
-		writeError(w, 400, "invalid_policy", "승인 정책을 확인해 주세요.")
+	reason, ok := validateApprovalPolicy(&in)
+	if !ok {
+		// An administrator must always be able to switch a policy off. A row
+		// stored before these condition checks existed can hold a value we now
+		// refuse, and the console's enable/disable sends the row back exactly as
+		// it was read, so refusing the unchanged conditions would strand it: it
+		// could not be disabled, and once it has handled a request it cannot be
+		// deleted either. Only saving a *different* broken condition is refused,
+		// so re-check the rest of the policy with the stored value set aside and
+		// then write it back untouched.
+		if stored, found := s.storedPolicyConditions(r, id); found && reflect.DeepEqual(stored, in.Conditions) {
+			asStored := in.Conditions
+			in.Conditions = map[string]any{}
+			reason, ok = validateApprovalPolicy(&in)
+			in.Conditions = asStored
+		}
+	}
+	if !ok {
+		writeError(w, 400, "invalid_policy", "승인 정책을 확인해 주세요. "+reason)
 		return
 	}
 	p, _ := principalFrom(r.Context())

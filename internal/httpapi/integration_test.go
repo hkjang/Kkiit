@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -3172,6 +3173,223 @@ func TestIntegrationApprovalQueueReportsTheWait(t *testing.T) {
 	}
 	if stale := operator.do(http.MethodGet, "/api/v1/admin/dashboard", nil, http.StatusOK)["stale_approvals"].(float64); stale < 1 {
 		t.Fatalf("검토 지연 집계=%v", stale)
+	}
+}
+
+// publishTalentOfType creates one more talent for a seller that already has a
+// profile and returns the status publishing produced, which is what the
+// approval policy decides.
+func publishTalentOfType(t *testing.T, seller *client, serviceType, title string, price int64) (string, string) {
+	t.Helper()
+	talent := seller.do(http.MethodPost, "/api/v1/talents", map[string]any{
+		"title": title, "summary": title, "description": title + " 상세 설명입니다.",
+		"service_type": serviceType, "base_price": price, "delivery_days": 3, "currency": "KRW", "revision_count": 1,
+		"scope_included": []string{}, "scope_excluded": []string{}, "deliverables": []string{}, "tags": []string{"test"},
+		"faq": []any{}, "refund_policy": "전액 환불", "instant_order": true, "quote_required": false, "subscription_enabled": false,
+		"packages":     []map[string]any{{"package_type": "BASIC", "name": "기본", "description": "기본", "price": price, "delivery_days": 3, "revision_count": 1, "features": []string{}, "deliverables": []string{}, "sort_order": 0, "active": true}},
+		"requirements": []map[string]any{{"label": "요구사항", "help_text": "", "field_type": "textarea", "required": true, "options": []any{}, "validation": map[string]any{}, "sort_order": 0}},
+	}, http.StatusCreated)
+	talentID, _ := talent["id"].(string)
+	if talentID == "" {
+		t.Fatal("상품 식별자가 없습니다")
+	}
+	published := seller.do(http.MethodPost, "/api/v1/talents/"+talentID+"/publish", nil, http.StatusOK)
+	return talentID, fmt.Sprint(published["status"])
+}
+
+// TestIntegrationApprovalPolicyArrayConditionsAreCheckedOnSave pins both halves
+// of the same contract: saving refuses an array condition the matcher would
+// skip, and a well formed one still decides publishing exactly as before. The
+// matcher reads service_types with a []any assertion, so a policy stored with a
+// bare string would quietly apply to every product instead of the ones it names.
+func TestIntegrationApprovalPolicyArrayConditionsAreCheckedOnSave(t *testing.T) {
+	server, pool := integrationServer(t)
+	operatorName := uniqueName("arraycondop")
+	operator := newClient(t, server.URL)
+	operator.register(operatorName)
+	grantRole(t, pool, operatorName, "super_admin")
+	operator.do(http.MethodPost, "/api/v1/auth/logout", nil, http.StatusNoContent)
+	operator.do(http.MethodPost, "/api/v1/auth/login", map[string]any{"username": operatorName, "password": "IntegrationPass!23"}, http.StatusOK)
+
+	// Policies left enabled by earlier tests would also decide these products,
+	// so they step aside while this one runs.
+	var parked []string
+	rows, err := pool.Query(context.Background(), `SELECT id FROM approval_policies WHERE resource_type='talent_publish' AND enabled`)
+	if err != nil {
+		t.Fatalf("기존 정책 조회 실패: %v", err)
+	}
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			parked = append(parked, id)
+		}
+	}
+	rows.Close()
+	if len(parked) > 0 {
+		if _, err := pool.Exec(context.Background(), `UPDATE approval_policies SET enabled=false WHERE id=ANY($1)`, parked); err != nil {
+			t.Fatalf("기존 정책 비활성화 실패: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(), `UPDATE approval_policies SET enabled=true WHERE id=ANY($1)`, parked)
+		})
+	}
+
+	countPolicies := func() int {
+		listed := operator.do(http.MethodGet, "/api/v1/admin/approvals/policies", nil, http.StatusOK)["items"].([]any)
+		return len(listed)
+	}
+	before := countPolicies()
+
+	for _, broken := range []struct {
+		name  string
+		key   string
+		value any
+	}{
+		{"배열이 아닌 문자열", "service_types", "AI"},
+		{"원소가 숫자", "service_types", []any{"AI", 3}},
+		{"공백뿐인 문자열", "seller_levels", []any{"NEW", "  "}},
+		{"배열이 아닌 문자열", "seller_levels", "NEW"},
+	} {
+		rejected := operator.do(http.MethodPost, "/api/v1/admin/approvals/policies", map[string]any{
+			"resource_type": "talent_publish", "name": uniqueName("배열 조건 거부"), "enabled": true, "priority": 1,
+			"conditions": map[string]any{broken.key: broken.value}, "steps": []map[string]any{{"role": "operator", "min_approvals": 1}},
+		}, http.StatusBadRequest)
+		failure, _ := rejected["error"].(map[string]any)
+		if fmt.Sprint(failure["code"]) != "invalid_policy" {
+			t.Fatalf("%s %s 거부 코드=%v", broken.key, broken.name, rejected["error"])
+		}
+		if message := fmt.Sprint(failure["message"]); !strings.Contains(message, broken.key) {
+			t.Fatalf("%s %s 거부 메시지에 키 이름이 없습니다: %q", broken.key, broken.name, message)
+		}
+	}
+	if after := countPolicies(); after != before {
+		t.Fatalf("거부된 정책이 저장되었습니다: 이전 %d, 이후 %d", before, after)
+	}
+
+	// A well formed policy is stored and keeps deciding as it did before.
+	policy := operator.do(http.MethodPost, "/api/v1/admin/approvals/policies", map[string]any{
+		"resource_type": "talent_publish", "name": uniqueName("AI 검토 정책"), "enabled": true, "priority": 1,
+		"conditions": map[string]any{"service_types": []string{"AI"}}, "steps": []map[string]any{{"role": "operator", "min_approvals": 1}},
+	}, http.StatusCreated)
+	policyID := fmt.Sprint(policy["id"])
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE approval_policies SET enabled=false WHERE id=$1`, policyID)
+	})
+
+	// Editing it with a broken array is refused too, and the stored row keeps
+	// the array it had.
+	updateRejected := operator.do(http.MethodPut, "/api/v1/admin/approvals/policies/"+policyID, map[string]any{
+		"resource_type": "talent_publish", "name": "AI 검토 정책", "enabled": true, "priority": 1,
+		"conditions": map[string]any{"service_types": "AI"}, "steps": []map[string]any{{"role": "operator", "min_approvals": 1}},
+	}, http.StatusBadRequest)
+	updateFailure, _ := updateRejected["error"].(map[string]any)
+	if message := fmt.Sprint(updateFailure["message"]); !strings.Contains(message, "service_types") {
+		t.Fatalf("수정 거부 메시지에 키 이름이 없습니다: %q", message)
+	}
+	var stored string
+	if err := pool.QueryRow(context.Background(), `SELECT conditions->>'service_types' FROM approval_policies WHERE id=$1`, policyID).Scan(&stored); err != nil {
+		t.Fatalf("저장된 조건 조회 실패: %v", err)
+	}
+	if stored != `["AI"]` {
+		t.Fatalf("거부된 수정이 저장되었습니다: %s", stored)
+	}
+
+	// The same value now decides publishing on the matcher side: the AI product
+	// waits for review, the human one goes straight out.
+	seller, _, _ := sellTalent(t, server, "arraycondseller", uniqueName("사람 상품"), 40_000)
+	aiID, aiStatus := publishTalentOfType(t, seller, "AI", uniqueName("AI 상품"), 40_000)
+	if aiStatus != "review_pending" {
+		t.Fatalf("service_types가 맞는 상품의 상태=%s", aiStatus)
+	}
+	humanID, humanStatus := publishTalentOfType(t, seller, "HUMAN", uniqueName("사람 상품"), 40_000)
+	if humanStatus != "published" {
+		t.Fatalf("service_types가 맞지 않는 상품의 상태=%s", humanStatus)
+	}
+	for id, want := range map[string]string{aiID: "review_pending", humanID: "published"} {
+		var status string
+		if err := pool.QueryRow(context.Background(), `SELECT status FROM talents WHERE id=$1`, id).Scan(&status); err != nil {
+			t.Fatalf("상품 상태 조회 실패: %v", err)
+		}
+		if status != want {
+			t.Fatalf("상품 %s의 저장된 상태=%s, 기대=%s", id, status, want)
+		}
+	}
+}
+
+// TestIntegrationBrokenPolicyConditionsCanStillBeDisabled covers the row that is
+// already there. A policy saved before the condition check existed can hold an
+// array the console now refuses, and the enable/disable switch sends the row
+// back exactly as it was read. Refusing it there would leave an administrator no
+// way to stop the policy, because deleting one that has handled a request is
+// refused too. Changing the conditions to another broken value stays refused.
+func TestIntegrationBrokenPolicyConditionsCanStillBeDisabled(t *testing.T) {
+	server, pool := integrationServer(t)
+	operatorName := uniqueName("brokencondop")
+	operator := newClient(t, server.URL)
+	operator.register(operatorName)
+	grantRole(t, pool, operatorName, "super_admin")
+	operator.do(http.MethodPost, "/api/v1/auth/logout", nil, http.StatusNoContent)
+	operator.do(http.MethodPost, "/api/v1/auth/login", map[string]any{"username": operatorName, "password": "IntegrationPass!23"}, http.StatusOK)
+
+	broken := map[string]any{"service_types": "AI", "seller_levels": []any{float64(1), nil}}
+	var policyID string
+	if err := pool.QueryRow(context.Background(), `INSERT INTO approval_policies(id,resource_type,name,enabled,priority,conditions,steps)
+		VALUES(gen_random_uuid(),'talent_publish',$1,true,100,$2,'[{"role":"operator","min_approvals":1}]'::jsonb) RETURNING id`,
+		uniqueName("예전에 저장된 정책"), broken).Scan(&policyID); err != nil {
+		t.Fatalf("예전 정책 삽입 실패: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM approval_policies WHERE id=$1`, policyID) })
+
+	storedConditions := func() map[string]any {
+		var raw []byte
+		if err := pool.QueryRow(context.Background(), `SELECT conditions FROM approval_policies WHERE id=$1`, policyID).Scan(&raw); err != nil {
+			t.Fatalf("저장된 조건 조회 실패: %v", err)
+		}
+		var conditions map[string]any
+		if err := json.Unmarshal(raw, &conditions); err != nil {
+			t.Fatalf("저장된 조건 해석 실패: %v", err)
+		}
+		return conditions
+	}
+
+	// Read it back the way the console does, then send that row back with only
+	// the switch moved.
+	var listed map[string]any
+	for _, raw := range operator.do(http.MethodGet, "/api/v1/admin/approvals/policies", nil, http.StatusOK)["items"].([]any) {
+		if item, _ := raw.(map[string]any); item != nil && fmt.Sprint(item["id"]) == policyID {
+			listed = item
+		}
+	}
+	if listed == nil {
+		t.Fatal("목록에 정책이 없습니다")
+	}
+	if !reflect.DeepEqual(listed["conditions"], broken) {
+		t.Fatalf("목록이 조건을 그대로 돌려주지 않았습니다: %v", listed["conditions"])
+	}
+	toggle := map[string]any{"resource_type": listed["resource_type"], "name": listed["name"], "enabled": false, "priority": listed["priority"], "conditions": listed["conditions"], "steps": listed["steps"]}
+	operator.do(http.MethodPut, "/api/v1/admin/approvals/policies/"+policyID, toggle, http.StatusOK)
+	var enabled bool
+	if err := pool.QueryRow(context.Background(), `SELECT enabled FROM approval_policies WHERE id=$1`, policyID).Scan(&enabled); err != nil {
+		t.Fatalf("활성 상태 조회 실패: %v", err)
+	}
+	if enabled {
+		t.Fatal("잘못된 조건을 가진 정책을 끄지 못했습니다")
+	}
+	if conditions := storedConditions(); !reflect.DeepEqual(conditions, broken) {
+		t.Fatalf("전환이 조건을 바꿨습니다: %v", conditions)
+	}
+
+	// Putting a different broken value on the same row is still a 400, and the
+	// row keeps what it had.
+	changed := map[string]any{"resource_type": "talent_publish", "name": listed["name"], "enabled": false, "priority": listed["priority"],
+		"conditions": map[string]any{"service_types": "HUMAN", "seller_levels": []any{float64(1), nil}}, "steps": listed["steps"]}
+	rejected := operator.do(http.MethodPut, "/api/v1/admin/approvals/policies/"+policyID, changed, http.StatusBadRequest)
+	failure, _ := rejected["error"].(map[string]any)
+	if message := fmt.Sprint(failure["message"]); !strings.Contains(message, "service_types") {
+		t.Fatalf("바뀐 잘못된 조건의 거부 메시지=%q", message)
+	}
+	if conditions := storedConditions(); !reflect.DeepEqual(conditions, broken) {
+		t.Fatalf("거부된 수정이 저장되었습니다: %v", conditions)
 	}
 }
 

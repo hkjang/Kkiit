@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -89,11 +90,53 @@ func TestProviderAutoLoginIsOffUnlessAnOIDCProviderSaysOtherwise(t *testing.T) {
 
 func TestValidateApprovalPolicyRejectsInvalidConditions(t *testing.T) {
 	valid := approvalPolicyInput{ResourceType: "talent_publish", Name: "고액 주문", Conditions: map[string]any{"min_amount": float64(100_000)}, Steps: []map[string]any{{"role": "operator", "min_approvals": float64(1)}}}
-	if !validateApprovalPolicy(&valid) {
+	if _, ok := validateApprovalPolicy(&valid); !ok {
 		t.Fatal("expected valid approval policy")
 	}
 	invalid := approvalPolicyInput{ResourceType: "talent_publish", Name: "잘못된 범위", Conditions: map[string]any{"min_amount": float64(200), "max_amount": float64(100)}, Steps: []map[string]any{{"role": "operator", "min_approvals": float64(1)}}}
-	if validateApprovalPolicy(&invalid) {
+	if _, ok := validateApprovalPolicy(&invalid); ok {
 		t.Fatal("minimum greater than maximum must be rejected")
+	}
+}
+
+// The matcher skips service_types and seller_levels whenever the stored value
+// is not a []any of strings, so a policy saved with a bare string applies to
+// every product instead of the few it names. Saving has to refuse it.
+func TestValidateApprovalPolicyRejectsInvalidArrayConditions(t *testing.T) {
+	for _, key := range []string{"service_types", "seller_levels"} {
+		for _, broken := range []struct {
+			name  string
+			value any
+		}{
+			{"배열이 아닌 문자열", "design"},
+			{"원소가 숫자", []any{"design", float64(3)}},
+			{"공백뿐인 문자열", []any{"design", "   "}},
+		} {
+			policy := approvalPolicyInput{ResourceType: "talent_publish", Name: "배열 조건", Conditions: map[string]any{key: broken.value}, Steps: []map[string]any{{"role": "operator", "min_approvals": float64(1)}}}
+			reason, ok := validateApprovalPolicy(&policy)
+			if ok {
+				t.Fatalf("%s의 %s는 거부되어야 합니다", key, broken.name)
+			}
+			// The administrator has to learn which key to correct.
+			if !strings.Contains(reason, key) {
+				t.Fatalf("%s의 %s 거부 사유에 키 이름이 없습니다: %q", key, broken.name, reason)
+			}
+		}
+		// An empty list and an absent key keep working: the matcher only applies
+		// the condition when it holds a value, so refusing them here would change
+		// which products existing policies cover.
+		for _, allowed := range []struct {
+			name       string
+			conditions map[string]any
+		}{
+			{"정상 배열", map[string]any{key: []any{"design"}}},
+			{"빈 배열", map[string]any{key: []any{}}},
+			{"키 없음", map[string]any{}},
+		} {
+			policy := approvalPolicyInput{ResourceType: "talent_publish", Name: "배열 조건", Conditions: allowed.conditions, Steps: []map[string]any{{"role": "operator", "min_approvals": float64(1)}}}
+			if reason, ok := validateApprovalPolicy(&policy); !ok {
+				t.Fatalf("%s의 %s는 허용되어야 합니다: %s", key, allowed.name, reason)
+			}
+		}
 	}
 }

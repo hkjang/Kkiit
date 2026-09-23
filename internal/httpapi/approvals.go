@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -119,6 +120,20 @@ func validateStringListCondition(conditions map[string]any, key string) (string,
 	return "", true
 }
 
+// storedPolicyConditions reads the conditions column as it stands now, so an
+// update that leaves them alone can be told apart from one that changes them.
+func (s *Server) storedPolicyConditions(r *http.Request, id uuid.UUID) (map[string]any, bool) {
+	var raw []byte
+	if err := s.DB.QueryRow(r.Context(), `SELECT conditions FROM approval_policies WHERE id=$1`, id).Scan(&raw); err != nil {
+		return nil, false
+	}
+	stored := map[string]any{}
+	if json.Unmarshal(raw, &stored) != nil {
+		return nil, false
+	}
+	return stored, true
+}
+
 func numericValue(value any) (float64, bool) {
 	switch number := value.(type) {
 	case int:
@@ -188,7 +203,24 @@ func (s *Server) updateApprovalPolicy(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in) {
 		return
 	}
-	if reason, ok := validateApprovalPolicy(&in); !ok {
+	reason, ok := validateApprovalPolicy(&in)
+	if !ok {
+		// An administrator must always be able to switch a policy off. A row
+		// stored before these condition checks existed can hold a value we now
+		// refuse, and the console's enable/disable sends the row back exactly as
+		// it was read, so refusing the unchanged conditions would strand it: it
+		// could not be disabled, and once it has handled a request it cannot be
+		// deleted either. Only saving a *different* broken condition is refused,
+		// so re-check the rest of the policy with the stored value set aside and
+		// then write it back untouched.
+		if stored, found := s.storedPolicyConditions(r, id); found && reflect.DeepEqual(stored, in.Conditions) {
+			asStored := in.Conditions
+			in.Conditions = map[string]any{}
+			reason, ok = validateApprovalPolicy(&in)
+			in.Conditions = asStored
+		}
+	}
+	if !ok {
 		writeError(w, 400, "invalid_policy", "승인 정책을 확인해 주세요. "+reason)
 		return
 	}

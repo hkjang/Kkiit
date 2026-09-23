@@ -31,7 +31,7 @@ async function until(check, label) {
   }
   throw new Error(`Timed out: ${label}`)
 }
-async function api(method, url, body) {
+async function request(method, url, body) {
   const response = await fetch(base + url, {
     method, headers: { Cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join('; '), 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -40,9 +40,17 @@ async function api(method, url, body) {
     const pair = raw.split(';')[0], at = pair.indexOf('=')
     cookies.set(pair.slice(0, at), pair.slice(at + 1))
   }
+  return response
+}
+async function api(method, url, body) {
+  const response = await request(method, url, body)
   assert.ok(response.ok, `${method} ${url}: ${response.status}`)
   return response.status === 204 ? undefined : response.json()
 }
+// Rows the API refuses are planted straight into the disposable database, the
+// way a release before that check would have left them.
+const sql = (statement) => execFileSync('docker', ['exec', container, 'psql', '-U', 'postgres', '-d', 'postgres', '-Atq', '-c', statement], { encoding: 'utf8' }).trim().split('\n')[0].trim()
+const policyBody = (item) => ({ name: item.name, resource_type: 'talent_publish', enabled: false, priority: 100, conditions: item.conditions, steps: [{ role: 'operator', min_approvals: 1 }] })
 const cases = [
   { name: '제한 없음', conditions: {}, text: ['조건 없음 · 모든 상품에 적용'] },
   { name: '최소 금액 0', conditions: { min_amount: 0 }, text: ['최소 금액 0원 이상'] },
@@ -53,8 +61,12 @@ const cases = [
   { name: '빈 배열', conditions: { service_types: [], seller_levels: [] }, text: ['조건 없음 · 모든 상품에 적용'] },
   { name: '최대 금액 0', conditions: { max_amount: 0 }, text: ['최대 금액 0원 이하'] },
   { name: '알 수 없는 키', conditions: { future_condition: true }, text: ['일부 조건 확인 필요'], invalid: true },
-  { name: '잘못된 배열', conditions: { service_types: 'AI', seller_levels: [1, null] }, text: ['일부 조건 확인 필요'], invalid: true },
-  { name: '정상 조건과 잘못된 조건', conditions: { min_amount: 0, service_types: ['AI', 1] }, text: ['최소 금액 0원 이상', '일부 조건 확인 필요'], invalid: true },
+  // Saving these is refused now (the matcher skips an array condition it cannot
+  // read, which would widen the policy to every product), so the API must say
+  // 400 and the row is planted directly to keep proving what the console does
+  // with a policy stored before that check existed.
+  { name: '잘못된 배열', conditions: { service_types: 'AI', seller_levels: [1, null] }, text: ['일부 조건 확인 필요'], invalid: true, refused: true },
+  { name: '정상 조건과 잘못된 조건', conditions: { min_amount: 0, service_types: ['AI', 1] }, text: ['최소 금액 0원 이상', '일부 조건 확인 필요'], invalid: true, refused: true },
 ]
 
 try {
@@ -74,7 +86,19 @@ try {
   await until(async () => { try { return (await fetch(base + '/health')).ok } catch { return false } }, 'Go server')
   await api('POST', '/api/v1/auth/login', { username: 'approval-smoke', password })
   for (const item of cases) {
-    const saved = await api('POST', endpoint, { name: item.name, resource_type: 'talent_publish', enabled: false, priority: 100, conditions: item.conditions, steps: [{ role: 'operator', min_approvals: 1 }] })
+    if (item.refused) {
+      const response = await request('POST', endpoint, policyBody(item))
+      assert.equal(response.status, 400, `${item.name}: 저장이 거절되어야 합니다`)
+      const { error } = await response.json()
+      assert.equal(error.code, 'invalid_policy', item.name)
+      // The administrator has to be told which key to correct.
+      assert.ok(Object.keys(item.conditions).some((key) => error.message.includes(key)), `${item.name}: ${error.message}`)
+      evidence.push({ stage: 'POST refused', name: item.name, conditions: item.conditions, status: response.status, message: error.message })
+      item.id = sql(`INSERT INTO approval_policies(id,resource_type,name,enabled,priority,conditions,steps) VALUES(gen_random_uuid(),'talent_publish',$k$${item.name}$k$,false,100,$k$${JSON.stringify(item.conditions)}$k$,$k$[{"role":"operator","min_approvals":1}]$k$) RETURNING id`)
+      assert.match(item.id, /^[0-9a-f-]{36}$/, `${item.name}: seeded id`)
+      continue
+    }
+    const saved = await api('POST', endpoint, policyBody(item))
     item.id = saved.id
   }
   const stored = (await api('GET', endpoint)).items
@@ -186,6 +210,24 @@ try {
   await until(async () => !(await api('GET', endpoint)).items.find((p) => p.id === item.id).enabled, 'toggle off')
   await evaluate(`${cardExpression(item)}.querySelectorAll('button')[1].click()`)
   await until(async () => !(await api('GET', endpoint)).items.some((p) => p.id === item.id), 'delete')
+  // A policy already stored with conditions the API now refuses must still be
+  // switchable off. The toggle sends the row back exactly as it was read, and
+  // once the policy has handled a request it cannot be deleted either, so a
+  // refusal here would leave the administrator no way to stop it.
+  const legacy = cases.find((c) => c.refused)
+  const legacyStored = async () => (await api('GET', endpoint)).items.find((p) => p.id === legacy.id)
+  await evaluate(`${cardExpression(legacy)}.querySelector('input[type="checkbox"]').click()`)
+  await until(async () => (await legacyStored()).enabled, 'legacy toggle on')
+  await until(async () => evaluate(`${cardExpression(legacy)}.querySelector('input').checked`), 'legacy toggle rendered')
+  await evaluate(`${cardExpression(legacy)}.querySelector('input[type="checkbox"]').click()`)
+  await until(async () => !(await legacyStored()).enabled, 'legacy toggle off')
+  assert.deepEqual((await legacyStored()).conditions, legacy.conditions, 'toggle must not rewrite the stored conditions')
+  // Putting a different broken condition on the same row is still refused.
+  const changed = await request('PUT', `${endpoint}/${legacy.id}`, { ...policyBody(legacy), conditions: { ...legacy.conditions, service_types: 'HUMAN' } })
+  assert.equal(changed.status, 400, 'changing conditions to another broken value must stay refused')
+  assert.ok((await changed.json()).error.message.includes('service_types'), 'refusal names the key')
+  assert.deepEqual((await legacyStored()).conditions, legacy.conditions, 'refused edit must not be stored')
+  evidence.push({ stage: 'legacy row toggle', name: legacy.name, conditions: legacy.conditions, refusedEdit: changed.status })
   // Create and change a policy through actual controlled React form inputs.
   async function fill(label, value) {
     await evaluate(`(() => {
@@ -235,8 +277,8 @@ try {
     evidence.push({ request: decision, quality_score: detail.quality_score, matched_policy: created.id })
   }
   assert.deepEqual(errors, [], 'browser runtime errors')
-  evidence.push({ controls: 'UI create/change, toggle on/off preserving array conditions, delete, approve/reject passed', viewport: '375px: no overlap or card overflow', browserErrors: errors })
-  console.log(`PASS: ${cases.length} real API/card cases, ${cases.filter((c) => !c.invalid).length} edit/save round trips, UI create/change, mobile layout, toggle/delete, unscored publish and approve/reject`)
+  evidence.push({ controls: 'UI create/change, toggle on/off preserving array conditions, legacy broken row still switchable off, delete, approve/reject passed', viewport: '375px: no overlap or card overflow', browserErrors: errors })
+  console.log(`PASS: ${cases.length} real API/card cases (${cases.filter((c) => c.refused).length} refused on save and seeded), ${cases.filter((c) => !c.invalid).length} edit/save round trips, UI create/change, mobile layout, toggle/delete, legacy row toggle, unscored publish and approve/reject`)
 } finally {
   if (output) writeFileSync(path.join(output, 'approval-evidence.json'), JSON.stringify(evidence, null, 2) + '\n')
   socket?.close()

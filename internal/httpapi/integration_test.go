@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -3312,6 +3313,83 @@ func TestIntegrationApprovalPolicyArrayConditionsAreCheckedOnSave(t *testing.T) 
 		if status != want {
 			t.Fatalf("상품 %s의 저장된 상태=%s, 기대=%s", id, status, want)
 		}
+	}
+}
+
+// TestIntegrationBrokenPolicyConditionsCanStillBeDisabled covers the row that is
+// already there. A policy saved before the condition check existed can hold an
+// array the console now refuses, and the enable/disable switch sends the row
+// back exactly as it was read. Refusing it there would leave an administrator no
+// way to stop the policy, because deleting one that has handled a request is
+// refused too. Changing the conditions to another broken value stays refused.
+func TestIntegrationBrokenPolicyConditionsCanStillBeDisabled(t *testing.T) {
+	server, pool := integrationServer(t)
+	operatorName := uniqueName("brokencondop")
+	operator := newClient(t, server.URL)
+	operator.register(operatorName)
+	grantRole(t, pool, operatorName, "super_admin")
+	operator.do(http.MethodPost, "/api/v1/auth/logout", nil, http.StatusNoContent)
+	operator.do(http.MethodPost, "/api/v1/auth/login", map[string]any{"username": operatorName, "password": "IntegrationPass!23"}, http.StatusOK)
+
+	broken := map[string]any{"service_types": "AI", "seller_levels": []any{float64(1), nil}}
+	var policyID string
+	if err := pool.QueryRow(context.Background(), `INSERT INTO approval_policies(id,resource_type,name,enabled,priority,conditions,steps)
+		VALUES(gen_random_uuid(),'talent_publish',$1,true,100,$2,'[{"role":"operator","min_approvals":1}]'::jsonb) RETURNING id`,
+		uniqueName("예전에 저장된 정책"), broken).Scan(&policyID); err != nil {
+		t.Fatalf("예전 정책 삽입 실패: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM approval_policies WHERE id=$1`, policyID) })
+
+	storedConditions := func() map[string]any {
+		var raw []byte
+		if err := pool.QueryRow(context.Background(), `SELECT conditions FROM approval_policies WHERE id=$1`, policyID).Scan(&raw); err != nil {
+			t.Fatalf("저장된 조건 조회 실패: %v", err)
+		}
+		var conditions map[string]any
+		if err := json.Unmarshal(raw, &conditions); err != nil {
+			t.Fatalf("저장된 조건 해석 실패: %v", err)
+		}
+		return conditions
+	}
+
+	// Read it back the way the console does, then send that row back with only
+	// the switch moved.
+	var listed map[string]any
+	for _, raw := range operator.do(http.MethodGet, "/api/v1/admin/approvals/policies", nil, http.StatusOK)["items"].([]any) {
+		if item, _ := raw.(map[string]any); item != nil && fmt.Sprint(item["id"]) == policyID {
+			listed = item
+		}
+	}
+	if listed == nil {
+		t.Fatal("목록에 정책이 없습니다")
+	}
+	if !reflect.DeepEqual(listed["conditions"], broken) {
+		t.Fatalf("목록이 조건을 그대로 돌려주지 않았습니다: %v", listed["conditions"])
+	}
+	toggle := map[string]any{"resource_type": listed["resource_type"], "name": listed["name"], "enabled": false, "priority": listed["priority"], "conditions": listed["conditions"], "steps": listed["steps"]}
+	operator.do(http.MethodPut, "/api/v1/admin/approvals/policies/"+policyID, toggle, http.StatusOK)
+	var enabled bool
+	if err := pool.QueryRow(context.Background(), `SELECT enabled FROM approval_policies WHERE id=$1`, policyID).Scan(&enabled); err != nil {
+		t.Fatalf("활성 상태 조회 실패: %v", err)
+	}
+	if enabled {
+		t.Fatal("잘못된 조건을 가진 정책을 끄지 못했습니다")
+	}
+	if conditions := storedConditions(); !reflect.DeepEqual(conditions, broken) {
+		t.Fatalf("전환이 조건을 바꿨습니다: %v", conditions)
+	}
+
+	// Putting a different broken value on the same row is still a 400, and the
+	// row keeps what it had.
+	changed := map[string]any{"resource_type": "talent_publish", "name": listed["name"], "enabled": false, "priority": listed["priority"],
+		"conditions": map[string]any{"service_types": "HUMAN", "seller_levels": []any{float64(1), nil}}, "steps": listed["steps"]}
+	rejected := operator.do(http.MethodPut, "/api/v1/admin/approvals/policies/"+policyID, changed, http.StatusBadRequest)
+	failure, _ := rejected["error"].(map[string]any)
+	if message := fmt.Sprint(failure["message"]); !strings.Contains(message, "service_types") {
+		t.Fatalf("바뀐 잘못된 조건의 거부 메시지=%q", message)
+	}
+	if conditions := storedConditions(); !reflect.DeepEqual(conditions, broken) {
+		t.Fatalf("거부된 수정이 저장되었습니다: %v", conditions)
 	}
 }
 

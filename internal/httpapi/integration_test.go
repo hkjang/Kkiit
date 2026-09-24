@@ -166,7 +166,14 @@ func (c *client) doWithHeaders(method, path string, body any, want int, headers 
 }
 
 func uniqueName(prefix string) string {
-	return fmt.Sprintf("%s%d", prefix, time.Now().UnixNano()%1_000_000_000)
+	return uniqueNameAt(prefix, time.Now().UnixNano())
+}
+
+// uniqueNameAt appends exactly nine digits so the result has a length callers
+// can count on; an unpadded suffix let a fixed slice go out of range, and a
+// panic in one test takes the whole package's binary with it.
+func uniqueNameAt(prefix string, nanos int64) string {
+	return fmt.Sprintf("%s%09d", prefix, nanos%1_000_000_000)
 }
 
 func (c *client) register(name string) {

@@ -1104,6 +1104,58 @@ func TestIntegrationReportTakesDownATalentAndHidesTheSeller(t *testing.T) {
 	seller.do(http.MethodGet, "/api/v1/me", nil, http.StatusUnauthorized)
 }
 
+// TestIntegrationReportSeparatesDuplicateFromStorageFailure pins down which of
+// the two ways an insert can fail the reporter is told about. Only a collision
+// with their own open case means "already reported"; anything else the database
+// refuses has to read as a failure, or the reporter walks away believing the
+// report landed.
+func TestIntegrationReportSeparatesDuplicateFromStorageFailure(t *testing.T) {
+	server, _ := integrationServer(t)
+	_, talentID, _ := sellTalent(t, server, "reportclass", uniqueName("신고분류")+" 상품", 50_000)
+	reporter := newClient(t, server.URL)
+	reporter.register(uniqueName("reportclass"))
+
+	reporter.do(http.MethodPost, "/api/v1/reports", map[string]any{
+		"resource_type": "talent", "resource_id": talentID, "reason": "fraud", "details": "설명과 다릅니다.", "evidence": []any{},
+	}, http.StatusCreated)
+	// A real duplicate keeps its own answer.
+	duplicate := reporter.do(http.MethodPost, "/api/v1/reports", map[string]any{
+		"resource_type": "talent", "resource_id": talentID, "reason": "spam", "details": "다시 신고", "evidence": []any{},
+	}, http.StatusConflict)
+	if code := errorCode(duplicate); code != "report_already_open" {
+		t.Fatalf("중복 신고의 오류 코드가 report_already_open 이 아닙니다: %q (%v)", code, duplicate)
+	}
+
+	// A NUL byte cannot be stored in a Postgres text column, so this insert
+	// fails for a reason that has nothing to do with a duplicate. The reporter
+	// here has no open case against this seller at all.
+	other := newClient(t, server.URL)
+	other.register(uniqueName("reportclass2"))
+	failed := other.do(http.MethodPost, "/api/v1/reports", map[string]any{
+		"resource_type": "talent", "resource_id": talentID, "reason": "fraud", "details": "저장할 수 없는 값\u0000입니다.", "evidence": []any{},
+	}, http.StatusInternalServerError)
+	if code := errorCode(failed); code == "report_already_open" {
+		t.Fatalf("중복이 아닌 저장 실패를 중복으로 안내했습니다: %v", failed)
+	}
+	if code := errorCode(failed); code != "report_failed" {
+		t.Fatalf("저장 실패의 오류 코드가 report_failed 가 아닙니다: %q (%v)", code, failed)
+	}
+
+	// The failed report left nothing behind, so the same reporter can still file
+	// a real one against the same target.
+	other.do(http.MethodPost, "/api/v1/reports", map[string]any{
+		"resource_type": "talent", "resource_id": talentID, "reason": "fraud", "details": "정상 신고", "evidence": []any{},
+	}, http.StatusCreated)
+}
+
+// errorCode digs the machine-readable code out of an error envelope, which is
+// the part callers branch on.
+func errorCode(payload map[string]any) string {
+	wrapper, _ := payload["error"].(map[string]any)
+	code, _ := wrapper["code"].(string)
+	return code
+}
+
 // mcpClient calls the MCP endpoint with an API key, the way an agent would.
 type mcpClient struct {
 	t    *testing.T

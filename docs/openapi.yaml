@@ -802,6 +802,7 @@ paths:
         '201': { description: report accepted }
         '400': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
   /coupons/preview:
     post:
       summary: 쿠폰 적용 미리보기

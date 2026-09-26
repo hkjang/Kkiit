@@ -14,9 +14,10 @@ import (
 )
 
 // isUniqueViolation reports whether a write failed because it collided with an
-// existing row rather than for any other reason. Coupon codes are unique in the
-// schema, so this is the difference between "that code is taken" and "the
-// database is unwell" — and callers used to report both as the same thing.
+// existing row rather than for any other reason. Wherever the schema declares
+// something unique — a coupon code, one open report per target — this is the
+// difference between "that one is taken" and "the database is unwell", and
+// callers used to report both as the same thing.
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"

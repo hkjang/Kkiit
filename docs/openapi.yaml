@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Kkiit Marketplace API
-  version: 0.4.6
+  version: 0.4.7
   description: Kkiit 재능·AI 서비스 마켓플레이스 REST API
 servers:
   - url: /api/v1

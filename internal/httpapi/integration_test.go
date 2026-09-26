@@ -945,6 +945,74 @@ func TestIntegrationCouponDiscountsBuyerWithoutTouchingSellerPayout(t *testing.T
 	}
 }
 
+// An operator who retypes an existing code needs to be told the code is taken.
+// Reporting "쿠폰을 찾을 수 없습니다" for a coupon they are looking at leaves them
+// with no way to find out what is actually wrong.
+func TestIntegrationDuplicateCouponCodeOnUpdateReportsConflictNotMissing(t *testing.T) {
+	server, pool := integrationServer(t)
+	operator := operatorClient(t, server, pool, "coupondupop")
+
+	takenCode := strings.ToUpper(uniqueName("TAKEN"))
+	ownCode := strings.ToUpper(uniqueName("OWN"))
+	newCoupon := func(code string) string {
+		created := operator.do(http.MethodPost, "/api/v1/admin/coupons", map[string]any{
+			"code": code, "name": "중복 검증 " + code, "discount_type": "fixed", "discount_value": 5_000,
+			"min_order_amount": 10_000, "per_user_limit": 1, "active": true,
+		}, http.StatusCreated)
+		id, _ := created["id"].(string)
+		if id == "" {
+			t.Fatalf("쿠폰 %s 생성 응답에 id가 없습니다: %v", code, created)
+		}
+		return id
+	}
+	newCoupon(takenCode)
+	ownID := newCoupon(ownCode)
+
+	// Renaming the second coupon onto the first one's code is a unique
+	// constraint violation, not a missing row.
+	conflict := operator.do(http.MethodPut, "/api/v1/admin/coupons/"+ownID, map[string]any{
+		"code": takenCode, "name": "중복으로 바꾸기", "discount_type": "fixed", "discount_value": 5_000,
+		"min_order_amount": 10_000, "per_user_limit": 1, "active": true,
+	}, http.StatusConflict)
+	failure, _ := conflict["error"].(map[string]any)
+	if failure["code"] != "coupon_exists" {
+		t.Fatalf("중복 코드 수정 오류=%v", conflict)
+	}
+
+	// A coupon that really is absent must still read as absent.
+	missing := operator.do(http.MethodPut, "/api/v1/admin/coupons/"+uuid.New().String(), map[string]any{
+		"code": strings.ToUpper(uniqueName("GONE")), "name": "없는 쿠폰", "discount_type": "fixed", "discount_value": 5_000,
+		"min_order_amount": 10_000, "per_user_limit": 1, "active": true,
+	}, http.StatusNotFound)
+	if absent, _ := missing["error"].(map[string]any); absent["code"] != "coupon_not_found" {
+		t.Fatalf("없는 쿠폰 수정 오류=%v", missing)
+	}
+
+	// The refused update must not have partially landed.
+	listed := operator.do(http.MethodGet, "/api/v1/admin/coupons", nil, http.StatusOK)
+	var found map[string]any
+	for _, raw := range listed["items"].([]any) {
+		if item, _ := raw.(map[string]any); item["id"] == ownID {
+			found = item
+		}
+	}
+	if found == nil {
+		t.Fatalf("수정을 거절당한 쿠폰 %s이 목록에서 사라졌습니다", ownID)
+	}
+	if found["code"] != ownCode || found["name"] != "중복 검증 "+ownCode {
+		t.Fatalf("거절된 수정이 쿠폰을 바꿨습니다: %v", found)
+	}
+
+	// The original code is still usable, so the duplicate never took effect.
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("coupondupbuyer"))
+	_, talentID, _ := sellTalent(t, server, "coupondupseller", "중복 코드 검증 상품", 100_000)
+	preview := buyer.do(http.MethodPost, "/api/v1/coupons/preview", map[string]any{"code": ownCode, "talent_id": talentID}, http.StatusOK)
+	if preview["discount_amount"] != float64(5_000) {
+		t.Fatalf("원래 코드 미리보기=%v", preview)
+	}
+}
+
 func TestIntegrationReportTakesDownATalentAndHidesTheSeller(t *testing.T) {
 	server, pool := integrationServer(t)
 	keyword := uniqueName("신고검증")

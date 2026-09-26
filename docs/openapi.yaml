@@ -1310,6 +1310,7 @@ paths:
       responses:
         '200': { description: updated }
         '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
     delete:
       summary: 쿠폰 사용 중단
       description: 사용 기록을 남기기 위해 삭제하지 않고 비활성화한다.

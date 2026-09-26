@@ -1,6 +1,12 @@
 package httpapi
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
 
 func cap64(value int64) *int64 { return &value }
 
@@ -66,6 +72,31 @@ func TestCouponInputValidation(t *testing.T) {
 		candidate := input
 		if _, ok := candidate.validate(); ok {
 			t.Fatalf("%s: 거부되어야 합니다", name)
+		}
+	}
+}
+
+// Only a unique violation means "that code is taken". Every other database
+// failure has to stay distinguishable, or an outage gets reported as a
+// duplicate and nobody goes looking for the real problem.
+func TestIsUniqueViolationOnlyMatchesConstraintCollisions(t *testing.T) {
+	if !isUniqueViolation(&pgconn.PgError{Code: "23505", ConstraintName: "coupons_code_key"}) {
+		t.Fatal("23505는 중복으로 판정되어야 합니다")
+	}
+	// The pool returns wrapped errors, so unwrapping has to work.
+	if !isUniqueViolation(fmt.Errorf("exec update: %w", &pgconn.PgError{Code: "23505"})) {
+		t.Fatal("감싸인 23505도 중복으로 판정되어야 합니다")
+	}
+	notDuplicates := map[string]error{
+		"검사 제약 위반":    &pgconn.PgError{Code: "23514"},
+		"외래키 위반":      &pgconn.PgError{Code: "23503"},
+		"not null 위반": &pgconn.PgError{Code: "23502"},
+		"연결 끊김":       errors.New("conn closed"),
+		"nil":         nil,
+	}
+	for name, err := range notDuplicates {
+		if isUniqueViolation(err) {
+			t.Fatalf("%s: 중복으로 판정되면 안 됩니다", name)
 		}
 	}
 }

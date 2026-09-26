@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,7 +10,17 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// isUniqueViolation reports whether a write failed because it collided with an
+// existing row rather than for any other reason. Coupon codes are unique in the
+// schema, so this is the difference between "that code is taken" and "the
+// database is unwell" — and callers used to report both as the same thing.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
 
 // couponTerms is the part of a coupon that decides the money, separated from
 // storage so the arithmetic can be tested without a database.
@@ -283,7 +294,11 @@ func (s *Server) createCoupon(w http.ResponseWriter, r *http.Request) {
 		id, in.Code, in.Name, in.DiscountType, in.DiscountValue, in.MinOrderAmount, in.MaxDiscountAmount, in.UsageLimit, in.PerUserLimit,
 		nullableTime(in.StartsAt), nullableTime(in.EndsAt), in.Active, p.UserID)
 	if err != nil {
-		writeError(w, 409, "coupon_exists", "이미 사용 중인 쿠폰 코드입니다.")
+		if isUniqueViolation(err) {
+			writeError(w, 409, "coupon_exists", "이미 사용 중인 쿠폰 코드입니다.")
+			return
+		}
+		writeError(w, 500, "coupon_save_failed", "쿠폰을 저장하지 못했습니다.")
 		return
 	}
 	s.audit(r, "coupon.create", "coupon", id.String(), nil, map[string]any{"code": in.Code, "discount_type": in.DiscountType, "discount_value": in.DiscountValue}, "success")
@@ -307,7 +322,15 @@ func (s *Server) updateCoupon(w http.ResponseWriter, r *http.Request) {
 		usage_limit=$8,per_user_limit=$9,starts_at=$10,ends_at=$11,active=$12 WHERE id=$1`,
 		id, in.Code, in.Name, in.DiscountType, in.DiscountValue, in.MinOrderAmount, in.MaxDiscountAmount, in.UsageLimit, in.PerUserLimit,
 		nullableTime(in.StartsAt), nullableTime(in.EndsAt), in.Active)
-	if err != nil || tag.RowsAffected() == 0 {
+	if err != nil {
+		if isUniqueViolation(err) {
+			writeError(w, 409, "coupon_exists", "이미 사용 중인 쿠폰 코드입니다.")
+			return
+		}
+		writeError(w, 500, "coupon_save_failed", "쿠폰을 저장하지 못했습니다.")
+		return
+	}
+	if tag.RowsAffected() == 0 {
 		writeError(w, 404, "coupon_not_found", "쿠폰을 찾을 수 없습니다.")
 		return
 	}

@@ -74,7 +74,14 @@ func (s *Server) createReport(w http.ResponseWriter, r *http.Request) {
 	_, err := s.DB.Exec(r.Context(), `INSERT INTO reports(id,reporter_id,resource_type,resource_id,reason,details,evidence) VALUES($1,$2,$3,$4,$5,$6,$7)`,
 		id, p.UserID, in.ResourceType, in.ResourceID, in.Reason, in.Details, in.Evidence)
 	if err != nil {
-		writeError(w, 409, "report_already_open", "이미 접수되어 처리 중인 신고가 있습니다.")
+		// Only a collision with this reporter's own open case means the report
+		// is already in hand; telling them that after a storage failure would
+		// have them stop waiting for an answer that is never coming.
+		if isUniqueViolation(err) {
+			writeError(w, 409, "report_already_open", "이미 접수되어 처리 중인 신고가 있습니다.")
+			return
+		}
+		writeError(w, 500, "report_failed", "신고를 접수하지 못했습니다. 잠시 후 다시 시도해 주세요.")
 		return
 	}
 	s.audit(r, "report.create", "report", id.String(), nil, map[string]any{"resource_type": in.ResourceType, "resource_id": in.ResourceID, "reason": in.Reason}, "success")

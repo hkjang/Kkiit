@@ -274,6 +274,8 @@ paths:
       parameters: [{ $ref: '#/components/parameters/Id' }]
       responses:
         '204': { description: deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
   /me/webhooks/{id}/test:
     post:
       summary: 웹훅 테스트 이벤트 전송

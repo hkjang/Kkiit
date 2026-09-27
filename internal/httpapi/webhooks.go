@@ -172,7 +172,13 @@ func (s *Server) updateMyWebhook(w http.ResponseWriter, r *http.Request) {
 		secret, encrypted = value, cipher
 	}
 	tag, err := s.DB.Exec(r.Context(), `UPDATE webhooks SET name=$3,target_url=$4,events=$5,enabled=$6,secret_encrypted=COALESCE($7,secret_encrypted),updated_at=now() WHERE id=$1 AND owner_id=$2`, id, p.UserID, in.Name, in.TargetURL, in.Events, enabled, encrypted)
-	if err != nil || tag.RowsAffected() == 0 {
+	// A failed save is not a missing webhook. Folding both into 404 told an owner
+	// who was looking at the webhook in their list that it did not exist.
+	if err != nil {
+		writeError(w, 500, "webhook_save_failed", "웹훅을 저장하지 못했습니다.")
+		return
+	}
+	if tag.RowsAffected() == 0 {
 		writeError(w, 404, "webhook_not_found", "웹훅을 찾을 수 없습니다.")
 		return
 	}
@@ -192,7 +198,11 @@ func (s *Server) deleteMyWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tag, err := s.DB.Exec(r.Context(), `DELETE FROM webhooks WHERE id=$1 AND owner_id=$2`, id, p.UserID)
-	if err != nil || tag.RowsAffected() == 0 {
+	if err != nil {
+		writeError(w, 500, "webhook_delete_failed", "웹훅을 삭제하지 못했습니다.")
+		return
+	}
+	if tag.RowsAffected() == 0 {
 		writeError(w, 404, "webhook_not_found", "웹훅을 찾을 수 없습니다.")
 		return
 	}

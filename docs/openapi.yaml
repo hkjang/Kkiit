@@ -266,7 +266,9 @@ paths:
             schema: { $ref: '#/components/schemas/WebhookInput' }
       responses:
         '200': { description: updated, includes a new secret when rotated }
+        '400': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
     delete:
       summary: 이벤트 웹훅 삭제
       parameters: [{ $ref: '#/components/parameters/Id' }]

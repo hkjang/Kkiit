@@ -5374,3 +5374,66 @@ func TestIntegrationApprovalShowsWhatIsBeingApproved(t *testing.T) {
 	seller.do(http.MethodGet, "/api/v1/admin/approvals/requests/"+requestID, nil, http.StatusForbidden)
 	operator.do(http.MethodGet, "/api/v1/admin/approvals/requests/"+uuid.New().String(), nil, http.StatusNotFound)
 }
+
+// TestIntegrationWebhookUpdateSeparatesSaveFailureFromNotFound pins down that a
+// failed save and a missing webhook are two different answers. The handler used
+// to fold every UPDATE error into 404 "웹훅을 찾을 수 없습니다.", so an owner who
+// was looking at the webhook in the list was told it did not exist. A NUL byte
+// in the name passes validateWebhookInput (which only measures length) and the
+// text column rejects it with SQLSTATE 22021, which makes the storage failure
+// reachable over HTTP without touching the rotation or encryption path.
+func TestIntegrationWebhookUpdateSeparatesSaveFailureFromNotFound(t *testing.T) {
+	server, _ := integrationServer(t)
+
+	ownerName := uniqueName("hookowner")
+	owner := newClient(t, server.URL)
+	owner.register(ownerName)
+
+	hook := owner.do(http.MethodPost, "/api/v1/me/webhooks", map[string]any{
+		"name": "저장 실패 훅", "target_url": "https://hooks.example.com/kkiit", "events": []string{"OrderPAID"},
+	}, http.StatusCreated)
+	hookID, _ := hook["id"].(string)
+	if hookID == "" {
+		t.Fatalf("웹훅 id 가 없습니다: %v", hook)
+	}
+	path := "/api/v1/me/webhooks/" + hookID
+
+	// The webhook exists and belongs to the caller, so the save failing is not
+	// the same thing as the webhook being missing.
+	failure := owner.do(http.MethodPut, path, map[string]any{
+		"name": "저장 실패\u0000", "target_url": "https://hooks.example.com/kkiit", "events": []string{"OrderPAID"},
+	}, http.StatusInternalServerError)
+	if code := failure["error"].(map[string]any)["code"]; code != "webhook_save_failed" {
+		t.Fatalf("저장 실패 코드=%v", failure["error"])
+	}
+
+	// A webhook that is not the caller's stays a 404.
+	missing := owner.do(http.MethodPut, "/api/v1/me/webhooks/"+uuid.New().String(), map[string]any{
+		"name": "없는 훅", "target_url": "https://hooks.example.com/kkiit", "events": []string{"OrderPAID"},
+	}, http.StatusNotFound)
+	if code := missing["error"].(map[string]any)["code"]; code != "webhook_not_found" {
+		t.Fatalf("없는 웹훅 코드=%v", missing["error"])
+	}
+
+	// And the ordinary save still works, rotation included.
+	owner.do(http.MethodPut, path, map[string]any{
+		"name": "정상 저장 훅", "target_url": "https://hooks.example.com/kkiit2", "events": []string{"OrderPAID", "OrderCOMPLETED"},
+	}, http.StatusOK)
+	rotated := owner.do(http.MethodPut, path, map[string]any{
+		"name": "정상 저장 훅", "target_url": "https://hooks.example.com/kkiit2", "events": []string{"OrderPAID"}, "rotate_secret": true,
+	}, http.StatusOK)
+	if secret, _ := rotated["secret"].(string); secret == "" || rotated["warning"] == nil {
+		t.Fatalf("서명 키 재발급 응답=%v", rotated)
+	}
+	listed := owner.do(http.MethodGet, "/api/v1/me/webhooks", nil, http.StatusOK)
+	for _, item := range listed["items"].([]any) {
+		entry := item.(map[string]any)
+		if entry["id"] == hookID && entry["name"] != "정상 저장 훅" {
+			t.Fatalf("실패한 저장이 이름을 바꿨습니다: %v", entry)
+		}
+	}
+
+	// Deleting keeps the same two answers.
+	owner.do(http.MethodDelete, "/api/v1/me/webhooks/"+uuid.New().String(), nil, http.StatusNotFound)
+	owner.do(http.MethodDelete, path, nil, http.StatusNoContent)
+}

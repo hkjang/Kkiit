@@ -177,12 +177,16 @@ paths:
             schema: { $ref: '#/components/schemas/PortfolioInput' }
       responses:
         '200': { description: updated }
+        '400': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
     delete:
       summary: 포트폴리오 삭제
       parameters: [{ $ref: '#/components/parameters/Id' }]
       responses:
         '204': { description: deleted }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
   /me/notifications:
     get:
       summary: 내 알림함

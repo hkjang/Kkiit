@@ -193,7 +193,14 @@ func (s *Server) updateMyPortfolio(w http.ResponseWriter, r *http.Request) {
 	}
 	tag, err := s.DB.Exec(r.Context(), `UPDATE portfolios SET title=$3,description=$4,media=$5,tags=$6,updated_at=now() WHERE id=$1 AND owner_id=$2`,
 		id, p.UserID, in.Title, in.Description, in.Media, in.Tags)
-	if err != nil || tag.RowsAffected() == 0 {
+	// A failed save is not a missing portfolio: the owner may well be looking at
+	// it in their own list. createMyPortfolio already reports the same table's
+	// INSERT failure as a 500, so keep the two answers apart here too.
+	if err != nil {
+		writeError(w, 500, "portfolio_save_failed", "포트폴리오를 저장하지 못했습니다.")
+		return
+	}
+	if tag.RowsAffected() == 0 {
 		writeError(w, 404, "portfolio_not_found", "포트폴리오를 찾을 수 없습니다.")
 		return
 	}
@@ -208,7 +215,11 @@ func (s *Server) deleteMyPortfolio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tag, err := s.DB.Exec(r.Context(), `DELETE FROM portfolios WHERE id=$1 AND owner_id=$2`, id, p.UserID)
-	if err != nil || tag.RowsAffected() == 0 {
+	if err != nil {
+		writeError(w, 500, "portfolio_delete_failed", "포트폴리오를 삭제하지 못했습니다.")
+		return
+	}
+	if tag.RowsAffected() == 0 {
 		writeError(w, 404, "portfolio_not_found", "포트폴리오를 찾을 수 없습니다.")
 		return
 	}

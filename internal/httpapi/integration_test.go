@@ -5437,3 +5437,58 @@ func TestIntegrationWebhookUpdateSeparatesSaveFailureFromNotFound(t *testing.T) 
 	owner.do(http.MethodDelete, "/api/v1/me/webhooks/"+uuid.New().String(), nil, http.StatusNotFound)
 	owner.do(http.MethodDelete, path, nil, http.StatusNoContent)
 }
+
+// TestIntegrationPortfolioUpdateSeparatesSaveFailureFromNotFound pins down that
+// a failed save and a missing portfolio are two different answers. The handler
+// used to fold every UPDATE error into 404 "포트폴리오를 찾을 수 없습니다.", so an
+// owner looking at the portfolio in their own list was told it did not exist —
+// while createMyPortfolio already reported the same table's INSERT failure as a
+// 500. A NUL byte in the title passes portfolioInput.validate (which only
+// measures rune length) and the text column rejects it with SQLSTATE 22021,
+// which makes the storage failure reachable over HTTP.
+func TestIntegrationPortfolioUpdateSeparatesSaveFailureFromNotFound(t *testing.T) {
+	server, _ := integrationServer(t)
+
+	owner := registerSeller(t, server, "portfolioowner")
+	created := owner.do(http.MethodPost, "/api/v1/me/portfolios", map[string]any{
+		"title": "저장 실패 포트폴리오", "description": "설명", "media": []any{}, "tags": []string{"go"},
+	}, http.StatusCreated)
+	portfolioID, _ := created["id"].(string)
+	if portfolioID == "" {
+		t.Fatalf("포트폴리오 id 가 없습니다: %v", created)
+	}
+	path := "/api/v1/me/portfolios/" + portfolioID
+
+	// The portfolio exists and belongs to the caller, so the save failing is not
+	// the same thing as the portfolio being missing.
+	failure := owner.do(http.MethodPut, path, map[string]any{
+		"title": "저장 실패\u0000", "description": "설명", "media": []any{}, "tags": []string{"go"},
+	}, http.StatusInternalServerError)
+	if code := failure["error"].(map[string]any)["code"]; code != "portfolio_save_failed" {
+		t.Fatalf("저장 실패 코드=%v", failure["error"])
+	}
+
+	// A portfolio that is not the caller's stays a 404.
+	missing := owner.do(http.MethodPut, "/api/v1/me/portfolios/"+uuid.New().String(), map[string]any{
+		"title": "없는 포트폴리오", "description": "설명", "media": []any{}, "tags": []string{"go"},
+	}, http.StatusNotFound)
+	if code := missing["error"].(map[string]any)["code"]; code != "portfolio_not_found" {
+		t.Fatalf("없는 포트폴리오 코드=%v", missing["error"])
+	}
+
+	// The ordinary save still works and the failed one changed nothing.
+	owner.do(http.MethodPut, path, map[string]any{
+		"title": "정상 저장 포트폴리오", "description": "설명", "media": []any{}, "tags": []string{"go", "api"},
+	}, http.StatusOK)
+	listed := owner.do(http.MethodGet, "/api/v1/me/portfolios", nil, http.StatusOK)
+	for _, item := range listed["items"].([]any) {
+		entry := item.(map[string]any)
+		if entry["id"] == portfolioID && entry["title"] != "정상 저장 포트폴리오" {
+			t.Fatalf("실패한 저장이 제목을 바꿨습니다: %v", entry)
+		}
+	}
+
+	// Deleting keeps the 404 for a portfolio that is not the caller's.
+	owner.do(http.MethodDelete, "/api/v1/me/portfolios/"+uuid.New().String(), nil, http.StatusNotFound)
+	owner.do(http.MethodDelete, path, nil, http.StatusNoContent)
+}

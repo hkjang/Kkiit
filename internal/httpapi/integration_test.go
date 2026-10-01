@@ -5492,3 +5492,102 @@ func TestIntegrationPortfolioUpdateSeparatesSaveFailureFromNotFound(t *testing.T
 	owner.do(http.MethodDelete, "/api/v1/me/portfolios/"+uuid.New().String(), nil, http.StatusNotFound)
 	owner.do(http.MethodDelete, path, nil, http.StatusNoContent)
 }
+
+// TestIntegrationAdminUserUpdateSeparatesSaveFailureFromNotFound pins down that
+// a failed save and a missing account are two different answers. The handler
+// used to fold every UPDATE error into 404 "사용자를 찾을 수 없습니다.", so an
+// operator looking at that very account on the investigation screen was told it
+// had disappeared the moment they tried to change its status or display name —
+// while resetAdminUserMFA in the same file already split a 500 from its 404. A
+// NUL byte in display_name passes the handler's TrimSpace and empty check, and
+// the text column rejects it with SQLSTATE 22021, which makes the storage
+// failure reachable over HTTP.
+func TestIntegrationAdminUserUpdateSeparatesSaveFailureFromNotFound(t *testing.T) {
+	server, pool := integrationServer(t)
+	background := context.Background()
+
+	// users.manage lives only on super_admin; the operator role does not carry it.
+	operator := operatorClient(t, server, pool, "useradmin")
+	grantRole(t, pool, operatorUsername(t, pool, operator), "super_admin")
+
+	name := uniqueName("targetuser")
+	target := newClient(t, server.URL)
+	target.register(name)
+	var userID string
+	if err := pool.QueryRow(background, `SELECT id::text FROM users WHERE username=$1`, name).Scan(&userID); err != nil {
+		t.Fatalf("user query: %v", err)
+	}
+	path := "/api/v1/admin/users/" + userID
+
+	auditsBefore, eventsBefore := userUpdateSideEffectCounts(t, pool, userID)
+
+	// The account exists, so the save failing is not the same thing as the
+	// account being missing.
+	failure := operator.do(http.MethodPatch, path, map[string]any{
+		"status": "active", "display_name": "관리자\u0000이름",
+	}, http.StatusInternalServerError)
+	if code := failure["error"].(map[string]any)["code"]; code != "user_save_failed" {
+		t.Fatalf("저장 실패 코드=%v", failure["error"])
+	}
+
+	// A failed save leaves no audit trail and no reactivation notice behind.
+	if audits, events := userUpdateSideEffectCounts(t, pool, userID); audits != auditsBefore || events != eventsBefore {
+		t.Fatalf("실패 경로가 감사·통지를 남겼습니다: audits %d→%d events %d→%d", auditsBefore, audits, eventsBefore, events)
+	}
+
+	// An account that does not exist stays a 404.
+	missing := operator.do(http.MethodPatch, "/api/v1/admin/users/"+uuid.New().String(), map[string]any{
+		"status": "active", "display_name": "없는 사용자",
+	}, http.StatusNotFound)
+	if code := missing["error"].(map[string]any)["code"]; code != "user_not_found" {
+		t.Fatalf("없는 사용자 코드=%v", missing["error"])
+	}
+
+	// The ordinary save still works, and the failed one changed nothing.
+	ok := operator.do(http.MethodPatch, path, map[string]any{
+		"status": "active", "display_name": "정상 표시 이름",
+	}, http.StatusOK)
+	if ok["ok"] != true {
+		t.Fatalf("정상 저장 응답=%v", ok)
+	}
+	var display, status string
+	if err := pool.QueryRow(background, `SELECT display_name,status FROM users WHERE id=$1::uuid`, userID).Scan(&display, &status); err != nil {
+		t.Fatalf("display query: %v", err)
+	}
+	if display != "정상 표시 이름" || status != "active" {
+		t.Fatalf("저장 결과 display=%q status=%q", display, status)
+	}
+
+	// Only the success path audits and notifies.
+	audits, events := userUpdateSideEffectCounts(t, pool, userID)
+	if audits != auditsBefore+1 {
+		t.Fatalf("성공 경로 감사 수=%d want=%d", audits, auditsBefore+1)
+	}
+	if events != eventsBefore+1 {
+		t.Fatalf("성공 경로 AccountReactivated 수=%d want=%d", events, eventsBefore+1)
+	}
+
+	// Suspending ends the account's sessions, which the failed save must not have
+	// done on its way out.
+	session := newClient(t, server.URL)
+	session.do(http.MethodPost, "/api/v1/auth/login", map[string]any{"username": name, "password": "IntegrationPass!23"}, http.StatusOK)
+	session.do(http.MethodGet, "/api/v1/me", nil, http.StatusOK)
+	operator.do(http.MethodPatch, path, map[string]any{"status": "suspended", "display_name": "정지된 사용자"}, http.StatusOK)
+	session.do(http.MethodGet, "/api/v1/me", nil, http.StatusUnauthorized)
+}
+
+// userUpdateSideEffectCounts reports the audit rows and reactivation notices
+// that a successful PATCH /admin/users/{id} is supposed to leave behind, so a
+// failing one can be shown to leave none.
+func userUpdateSideEffectCounts(t *testing.T, pool *pgxpool.Pool, userID string) (int, int) {
+	t.Helper()
+	background := context.Background()
+	var audits, events int
+	if err := pool.QueryRow(background, `SELECT count(*) FROM audit_logs WHERE action='user.update' AND resource_id=$1`, userID).Scan(&audits); err != nil {
+		t.Fatalf("audit count: %v", err)
+	}
+	if err := pool.QueryRow(background, `SELECT count(*) FROM domain_events WHERE aggregate_type='user' AND aggregate_id=$1::uuid AND event_type='AccountReactivated'`, userID).Scan(&events); err != nil {
+		t.Fatalf("event count: %v", err)
+	}
+	return audits, events
+}

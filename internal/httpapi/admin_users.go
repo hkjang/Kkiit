@@ -69,7 +69,14 @@ func (s *Server) updateAdminUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tag, err := s.DB.Exec(r.Context(), `UPDATE users SET status=$2,display_name=$3,updated_at=now() WHERE id=$1`, id, in.Status, in.DisplayName)
-	if err != nil || tag.RowsAffected() == 0 {
+	// A save that fails and an account that is not there are different answers.
+	// Folding them together told an operator looking at the account on the
+	// investigation screen that it had just disappeared.
+	if err != nil {
+		writeError(w, 500, "user_save_failed", "사용자 정보를 저장하지 못했습니다.")
+		return
+	}
+	if tag.RowsAffected() == 0 {
 		writeError(w, 404, "user_not_found", "사용자를 찾을 수 없습니다.")
 		return
 	}

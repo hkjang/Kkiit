@@ -183,12 +183,21 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context()) //nolint:errcheck
+	// Only a unique violation means the id or the email is taken. Every other
+	// storage failure has to say so: a visitor told "이미 사용 중인 아이디" goes off
+	// to invent another id, and no id they invent will work. The role insert
+	// carries a fresh uuid, so it can never be the duplicate.
 	_, err = tx.Exec(r.Context(), `INSERT INTO users(id,username,email,password_hash,display_name) VALUES($1,$2,$3,$4,$5)`, userID, input.Username, input.Email, hash, input.DisplayName)
-	if err == nil {
-		_, err = tx.Exec(r.Context(), `INSERT INTO user_roles(user_id,role_code) VALUES($1,'buyer')`, userID)
-	}
 	if err != nil {
-		writeError(w, http.StatusConflict, "account_exists", "이미 사용 중인 아이디 또는 이메일입니다.")
+		if isUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "account_exists", "이미 사용 중인 아이디 또는 이메일입니다.")
+			return
+		}
+		writeError(w, 500, "registration_failed", "가입을 완료하지 못했습니다.")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `INSERT INTO user_roles(user_id,role_code) VALUES($1,'buyer')`, userID); err != nil {
+		writeError(w, 500, "registration_failed", "가입을 완료하지 못했습니다.")
 		return
 	}
 	if err = tx.Commit(r.Context()); err != nil {

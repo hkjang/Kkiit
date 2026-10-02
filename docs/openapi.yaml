@@ -89,6 +89,11 @@ paths:
       summary: 공개 가입 정책에 따른 로컬 계정 가입
       responses:
         '201': { description: registered and signed in }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
   /me/seller-profile:
     get:
       summary: 내 판매자 프로필

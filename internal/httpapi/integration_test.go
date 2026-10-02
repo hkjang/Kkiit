@@ -5591,3 +5591,43 @@ func userUpdateSideEffectCounts(t *testing.T, pool *pgxpool.Pool, userID string)
 	}
 	return audits, events
 }
+
+// A visitor whose id and email are free must not be told they are taken when
+// the row simply failed to store. Signup is the one door a new account has, and
+// "이미 사용 중인 아이디" sends that visitor off to invent another id forever.
+func TestIntegrationRegisterSeparatesStorageFailureFromDuplicate(t *testing.T) {
+	server, pool := integrationServer(t)
+	background := context.Background()
+
+	// A NUL byte in display_name passes the handler's own checks and then makes
+	// PostgreSQL reject the INSERT with 22021 — a storage failure that has
+	// nothing to do with the id or the email being in use.
+	name := uniqueName("reg")
+	visitor := newClient(t, server.URL)
+	failed := visitor.do(http.MethodPost, "/api/v1/auth/register", map[string]any{
+		"username": name, "email": name + "@example.test", "display_name": "가입\u0000", "password": "IntegrationPass!23",
+	}, http.StatusInternalServerError)
+	if code := errorCode(failed); code != "registration_failed" {
+		t.Fatalf("저장 실패 코드=%q want=registration_failed", code)
+	}
+
+	var stored int
+	if err := pool.QueryRow(background, `SELECT count(*) FROM users WHERE username=$1`, name).Scan(&stored); err != nil {
+		t.Fatalf("user count: %v", err)
+	}
+	if stored != 0 {
+		t.Fatalf("실패한 가입이 사용자 %d명을 남겼습니다", stored)
+	}
+
+	// The same id is still free, so the retry without the NUL byte goes through.
+	visitor.register(name)
+
+	// And a real duplicate still says so.
+	other := newClient(t, server.URL)
+	duplicate := other.do(http.MethodPost, "/api/v1/auth/register", map[string]any{
+		"username": name, "email": uniqueName("reg") + "@example.test", "display_name": "중복 가입", "password": "IntegrationPass!23",
+	}, http.StatusConflict)
+	if code := errorCode(duplicate); code != "account_exists" {
+		t.Fatalf("중복 코드=%q want=account_exists", code)
+	}
+}

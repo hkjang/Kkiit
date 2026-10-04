@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -5630,4 +5631,83 @@ func TestIntegrationRegisterSeparatesStorageFailureFromDuplicate(t *testing.T) {
 	if code := errorCode(duplicate); code != "account_exists" {
 		t.Fatalf("중복 코드=%q want=account_exists", code)
 	}
+}
+
+// The handler's own comment promises that a malformed address stays a client
+// error so that a failure at the insert can be reported as what it is. It did
+// not hold: net.ParseCIDR accepts an address with host bits set (10.0.0.5/8,
+// whose network it quietly returns as 10.0.0.0/8) while the allowed_cidrs
+// column is cidr, which rejects it — so the owner's own typo came back as a
+// 500 "API 키를 저장하지 못했습니다." with nothing saying which field was wrong.
+// The validator also only trimmed the copy it inspected and handed the raw
+// entry to the insert, so a padded address was checked as one value and stored
+// as another.
+func TestIntegrationAPIKeyRejectsAddressesPostgresRejects(t *testing.T) {
+	server, _ := integrationServer(t)
+	owner := newClient(t, server.URL)
+	owner.register(uniqueName("cidrkey"))
+
+	// Values Go's parser accepts and the cidr column refuses, for both families.
+	for _, entry := range []string{"10.0.0.5/8", "2001:db8::1/32"} {
+		rejected := owner.do(http.MethodPost, "/api/v1/me/api-keys", map[string]any{
+			"name": "오타 키", "allowed_cidrs": []string{entry}, "rate_limit_per_minute": 60,
+		}, http.StatusBadRequest)
+		if code := errorCode(rejected); code != "invalid_key_policy" {
+			t.Fatalf("%s 거절 코드=%q want=invalid_key_policy", entry, code)
+		}
+	}
+
+	// A rejected request leaves no key behind.
+	if items, _ := owner.do(http.MethodGet, "/api/v1/me/api-keys", nil, http.StatusOK)["items"].([]any); len(items) != 0 {
+		t.Fatalf("거절된 요청이 키 %d개를 남겼습니다", len(items))
+	}
+
+	// Everything the column accepts still goes through, and comes back as sent.
+	for _, want := range [][]string{{"10.0.0.0/8", "192.168.1.0/24"}, {"2001:db8::/32"}, {}} {
+		owner.do(http.MethodPost, "/api/v1/me/api-keys", map[string]any{
+			"name": "정상 키", "allowed_cidrs": want, "rate_limit_per_minute": 60,
+		}, http.StatusCreated)
+		if got := latestKeyCIDRs(t, owner); !slices.Equal(got, want) {
+			t.Fatalf("allowed_cidrs=%v want=%v", got, want)
+		}
+	}
+	// Leaving the field out is still "no restriction" rather than a bad request.
+	owner.do(http.MethodPost, "/api/v1/me/api-keys", map[string]any{"name": "제한 없는 키", "rate_limit_per_minute": 60}, http.StatusCreated)
+	if got := latestKeyCIDRs(t, owner); len(got) != 0 {
+		t.Fatalf("필드를 생략한 키의 allowed_cidrs=%v want=[]", got)
+	}
+
+	// A padded address is stored as the value the validator inspected, so the
+	// list and the authentication check read what the owner was told was saved.
+	// The cidr column rejects the untrimmed text outright.
+	padded := owner.do(http.MethodPost, "/api/v1/me/api-keys", map[string]any{
+		"name": "공백 섞인 키", "allowed_cidrs": []string{" 10.0.0.0/8 "}, "rate_limit_per_minute": 60,
+	}, http.StatusCreated)
+	if got := latestKeyCIDRs(t, owner); !slices.Equal(got, []string{"10.0.0.0/8"}) {
+		t.Fatalf("공백 섞인 입력의 저장 값=%v want=[10.0.0.0/8]", got)
+	}
+
+	// Rotation re-validates the addresses PostgreSQL itself handed back, so the
+	// stricter check must agree with the column's own output notation.
+	owner.do(http.MethodPost, "/api/v1/me/api-keys/"+fmt.Sprint(padded["id"])+"/rotate", nil, http.StatusCreated)
+	if got := latestKeyCIDRs(t, owner); !slices.Equal(got, []string{"10.0.0.0/8"}) {
+		t.Fatalf("회전한 키의 allowed_cidrs=%v want=[10.0.0.0/8]", got)
+	}
+}
+
+// latestKeyCIDRs reads allowed_cidrs off the most recently created key through
+// the list endpoint, which is also where the owner would look for it.
+func latestKeyCIDRs(t *testing.T, c *client) []string {
+	t.Helper()
+	items, _ := c.do(http.MethodGet, "/api/v1/me/api-keys", nil, http.StatusOK)["items"].([]any)
+	if len(items) == 0 {
+		t.Fatal("키 목록이 비어 있습니다")
+	}
+	entry, _ := items[0].(map[string]any)
+	raw, _ := entry["allowed_cidrs"].([]any)
+	got := make([]string, 0, len(raw))
+	for _, value := range raw {
+		got = append(got, fmt.Sprint(value))
+	}
+	return got
 }

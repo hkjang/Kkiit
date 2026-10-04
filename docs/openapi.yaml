@@ -317,9 +317,11 @@ paths:
         '200': { description: keys without secrets }
     post:
       summary: 개인 API Key 발급
-      description: Secret 원문은 이 응답에서 한 번만 반환된다.
+      description: Secret 원문은 이 응답에서 한 번만 반환된다. allowed_cidrs 는 cidr 표기여야 하므로 호스트 비트가 켜진 주소(10.0.0.5/8)는 400 으로 거절된다.
       responses:
         '201': { description: created key with one-time secret }
+        '400': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
   /me/api-keys/{id}/rotate:
     post:
       summary: API Key 원자적 회전

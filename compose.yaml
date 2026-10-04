@@ -1,6 +1,6 @@
 services:
   kkiit:
-    image: kkiit:v0.4.12
+    image: kkiit:v0.4.13
     restart: unless-stopped
     ports:
       - "8080:8080"

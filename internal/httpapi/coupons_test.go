@@ -3,6 +3,8 @@ package httpapi
 import (
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,6 +20,51 @@ func TestComputeDiscountAppliesPercentAndCap(t *testing.T) {
 	capped, _, ok := computeDiscount(couponTerms{DiscountType: "percent", DiscountValue: 50, MaxDiscountAmount: cap64(20_000)}, 200_000)
 	if !ok || capped != 20_000 {
 		t.Fatalf("상한 적용 할인=%d ok=%v", capped, ok)
+	}
+}
+
+func TestComputeDiscountPercentInt64Boundaries(t *testing.T) {
+	for _, amount := range []int64{1, 2, 50, 99, 100, 101, 199, 200, 201, 10_001, 1 << 57, math.MaxInt64 - 7, math.MaxInt64 - 1, math.MaxInt64} {
+		t.Run(fmt.Sprintf("amount_%d", amount), func(t *testing.T) {
+			for rate := int64(1); rate <= 100; rate++ {
+				// Arbitrary precision keeps the oracle independent of int64 arithmetic.
+				wantBig := new(big.Int).Mul(big.NewInt(amount), big.NewInt(rate))
+				want := wantBig.Quo(wantBig, big.NewInt(100)).Int64()
+				discount, message, ok := computeDiscount(couponTerms{DiscountType: "percent", DiscountValue: rate}, amount)
+				if discount != want || ok != (want > 0) {
+					t.Fatalf("amount=%d rate=%d discount=%d ok=%v want=%d applicable=%v", amount, rate, discount, ok, want, want > 0)
+				}
+				if (ok && message != "") || (!ok && message == "") {
+					t.Fatalf("amount=%d rate=%d ok=%v message=%q", amount, rate, ok, message)
+				}
+			}
+		})
+	}
+}
+
+func TestComputeDiscountLargeAmountCapsAndMinimum(t *testing.T) {
+	cases := []struct {
+		name   string
+		terms  couponTerms
+		amount int64
+		want   int64
+	}{
+		{"percent capped", couponTerms{DiscountType: "percent", DiscountValue: 99, MaxDiscountAmount: cap64(20_000)}, math.MaxInt64, 20_000},
+		{"percent below cap", couponTerms{DiscountType: "percent", DiscountValue: 50, MaxDiscountAmount: cap64(math.MaxInt64)}, math.MaxInt64, 4_611_686_018_427_387_903},
+		{"percent zero cap", couponTerms{DiscountType: "percent", DiscountValue: 100, MaxDiscountAmount: cap64(0)}, math.MaxInt64, 0},
+		{"minimum met", couponTerms{DiscountType: "percent", DiscountValue: 100, MinOrderAmount: math.MaxInt64}, math.MaxInt64, math.MaxInt64},
+		{"below minimum", couponTerms{DiscountType: "percent", DiscountValue: 100, MinOrderAmount: math.MaxInt64}, math.MaxInt64 - 1, 0},
+		{"fixed capped", couponTerms{DiscountType: "fixed", DiscountValue: math.MaxInt64, MaxDiscountAmount: cap64(20_000)}, math.MaxInt64, 20_000},
+		{"fixed full amount", couponTerms{DiscountType: "fixed", DiscountValue: math.MaxInt64}, math.MaxInt64, math.MaxInt64},
+		{"fixed exceeds amount", couponTerms{DiscountType: "fixed", DiscountValue: math.MaxInt64}, 1 << 57, 1 << 57},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			discount, _, ok := computeDiscount(tc.terms, tc.amount)
+			if discount != tc.want || ok != (tc.want > 0) {
+				t.Fatalf("discount=%d ok=%v want=%d applicable=%v", discount, ok, tc.want, tc.want > 0)
+			}
+		})
 	}
 }
 
@@ -37,6 +84,10 @@ func TestComputeDiscountRejectsUnusableCombinations(t *testing.T) {
 		"최소 주문 미달":   {couponTerms{DiscountType: "fixed", DiscountValue: 5_000, MinOrderAmount: 100_000}, 50_000},
 		"알 수 없는 유형":  {couponTerms{DiscountType: "bogus", DiscountValue: 10}, 50_000},
 		"비율 범위 초과":   {couponTerms{DiscountType: "percent", DiscountValue: 120}, 50_000},
+		"비율 0":       {couponTerms{DiscountType: "percent", DiscountValue: 0}, 50_000},
+		"비율 음수":      {couponTerms{DiscountType: "percent", DiscountValue: -1}, 50_000},
+		"퍼센트 금액 0":   {couponTerms{DiscountType: "percent", DiscountValue: 100}, 0},
+		"퍼센트 금액 음수":  {couponTerms{DiscountType: "percent", DiscountValue: 100}, -1},
 		"할인이 0으로 내림": {couponTerms{DiscountType: "percent", DiscountValue: 1}, 50},
 		"금액 없음":      {couponTerms{DiscountType: "fixed", DiscountValue: 1_000}, 0},
 	}

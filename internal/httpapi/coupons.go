@@ -47,7 +47,8 @@ func computeDiscount(terms couponTerms, amount int64) (int64, string, bool) {
 		if terms.DiscountValue <= 0 || terms.DiscountValue > 100 {
 			return 0, "쿠폰 할인율이 올바르지 않습니다.", false
 		}
-		discount = amount * terms.DiscountValue / 100
+		// Split before multiplying to avoid overflow; each term and their sum stay <= amount.
+		discount = (amount/100)*terms.DiscountValue + (amount%100)*terms.DiscountValue/100
 	case "fixed":
 		discount = terms.DiscountValue
 	default:

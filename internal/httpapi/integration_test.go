@@ -849,6 +849,43 @@ func TestIntegrationFavoritesAndPortfolioAreVisibleWhereTheyMatter(t *testing.T)
 	}
 }
 
+func TestIntegrationCouponPercentLargeAmount(t *testing.T) {
+	server, pool := integrationServer(t)
+	operator := operatorClient(t, server, pool, "largecouponop")
+	code := strings.ToUpper(uniqueName("FREE"))
+	operator.do(http.MethodPost, "/api/v1/admin/coupons", map[string]any{
+		"code": code, "name": "큰 금액 전액 할인", "discount_type": "percent", "discount_value": 100,
+		"min_order_amount": 0, "per_user_limit": 1, "active": true,
+	}, http.StatusCreated)
+
+	// This power of two is exact even in the HTTP helper's float64 responses.
+	const amount int64 = 1 << 57
+	_, talentID, _ := sellTalent(t, server, "largecouponseller", "큰 금액 쿠폰 검증 상품", amount)
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("largecouponbuyer"))
+
+	preview := buyer.do(http.MethodPost, "/api/v1/coupons/preview", map[string]any{"code": code, "talent_id": talentID}, http.StatusOK)
+	if preview["amount"] != float64(amount) || preview["discount_amount"] != float64(amount) || preview["payable_amount"] != float64(0) {
+		t.Fatalf("미리보기=%v", preview)
+	}
+	order := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": "검증"}, "options": []any{}, "coupon_code": code,
+	}, http.StatusCreated)
+	if order["amount"] != float64(amount) || order["discount_amount"] != float64(amount) || order["payable_amount"] != float64(0) {
+		t.Fatalf("주문 금액=%v", order)
+	}
+	orderID, _ := order["id"].(string)
+	var storedAmount, storedDiscount, storedPayable, redeemedDiscount int64
+	if err := pool.QueryRow(context.Background(), `SELECT o.amount,o.discount_amount,o.amount-o.discount_amount,r.discount_amount
+		FROM orders o JOIN coupon_redemptions r ON r.order_id=o.id AND r.coupon_id=o.coupon_id AND r.user_id=o.buyer_id
+		WHERE o.id=$1`, orderID).Scan(&storedAmount, &storedDiscount, &storedPayable, &redeemedDiscount); err != nil {
+		t.Fatalf("주문/쿠폰 사용 기록 조회: %v", err)
+	}
+	if storedAmount != amount || storedDiscount != amount || storedPayable != 0 || redeemedDiscount != amount {
+		t.Fatalf("저장 금액=%d 할인=%d 지급=%d 쿠폰 사용=%d", storedAmount, storedDiscount, storedPayable, redeemedDiscount)
+	}
+}
+
 func TestIntegrationCouponDiscountsBuyerWithoutTouchingSellerPayout(t *testing.T) {
 	server, pool := integrationServer(t)
 	operator := operatorClient(t, server, pool, "couponop")

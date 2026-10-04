@@ -77,11 +77,20 @@ func (s *Server) validateKeyInput(r *http.Request, p Principal, in *apiKeyInput)
 		in.AllowedCIDRs = []string{}
 	}
 	// Checking the syntax here keeps a bad address a client error, so that a
-	// failure at the insert can be reported as what it is.
-	for _, entry := range in.AllowedCIDRs {
-		if _, _, err := net.ParseCIDR(strings.TrimSpace(entry)); err != nil {
+	// failure at the insert can be reported as what it is. That only holds while
+	// this agrees with the cidr column it feeds: ParseCIDR accepts an address
+	// with host bits set and quietly returns the network instead, where cidr
+	// refuses it, so 10.0.0.5/8 used to reach the insert and come back as a 500.
+	// Writing the trimmed value back is what keeps the entry this inspected and
+	// the entry that gets stored the same text — cidr rejects the padding too,
+	// and ipAllowed reads whatever ends up in the column.
+	for i, entry := range in.AllowedCIDRs {
+		value := strings.TrimSpace(entry)
+		ip, network, err := net.ParseCIDR(value)
+		if err != nil || !ip.Equal(network.IP) {
 			return false
 		}
+		in.AllowedCIDRs[i] = value
 	}
 	return true
 }

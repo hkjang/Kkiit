@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 const mcpProtocolVersion = "2025-11-25"
@@ -400,16 +402,48 @@ func (s *Server) callMCPTool(r *http.Request, raw json.RawMessage) (any, error) 
 
 func (s *Server) mcpSubmitRequirement(r *http.Request, args map[string]any) (any, error) {
 	p, _ := principalFrom(r.Context())
-	orderID := fmt.Sprint(args["order_id"])
+	// A malformed identifier used to reach PostgreSQL as $1::uuid and come back
+	// as a cast error, which this handler then reported as "not an order you can
+	// update" — the wrong diagnosis, and one the agent cannot act on.
+	orderUUID, err := uuid.Parse(strings.TrimSpace(fmt.Sprint(args["order_id"])))
+	if err != nil {
+		return nil, fmt.Errorf("order_id 는 주문 식별자(uuid)여야 합니다")
+	}
+	orderID := orderUUID.String()
 	requirements, ok := args["requirements"].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("requirements 객체가 필요합니다")
 	}
-	tag, err := s.DB.Exec(r.Context(), `UPDATE orders SET requirements=$3,state=CASE WHEN state='REQUIREMENT_PENDING' THEN 'READY' ELSE state END,updated_at=now() WHERE id=$1::uuid AND buyer_id=$2 AND state IN ('CREATED','PAID','REQUIREMENT_PENDING')`, orderID, p.UserID, requirements)
-	if err != nil || tag.RowsAffected() == 0 {
+	// The answers have to clear the seller's order form here exactly as they do
+	// when the order is created. Without that an agent holding orders.buy could
+	// overwrite the brief the seller was given with an empty object, and the
+	// order would still move to READY — either through this tool's own promotion
+	// or through the buyer's payment — which tells the seller the form is
+	// complete and the work can start over nothing at all.
+	tx, err := s.DB.Begin(r.Context())
+	if err != nil {
+		return nil, fmt.Errorf("요구사항을 저장하지 못했습니다")
+	}
+	defer tx.Rollback(r.Context())
+	var talentID uuid.UUID
+	if err := tx.QueryRow(r.Context(), `SELECT talent_id FROM orders WHERE id=$1 AND buyer_id=$2 AND state IN ('CREATED','PAID','REQUIREMENT_PENDING')`, orderUUID, p.UserID).Scan(&talentID); err != nil {
 		return nil, fmt.Errorf("요구사항을 갱신할 수 있는 주문이 아닙니다")
 	}
-	s.audit(r, "order.requirements_update", "order", orderID, nil, requirements, "success")
+	normalized, message, ok := normalizeRequirements(r.Context(), tx, talentID, requirements, true)
+	if !ok {
+		return nil, fmt.Errorf("%s", message)
+	}
+	tag, err := tx.Exec(r.Context(), `UPDATE orders SET requirements=$3,state=CASE WHEN state='REQUIREMENT_PENDING' THEN 'READY' ELSE state END,updated_at=now() WHERE id=$1 AND buyer_id=$2 AND state IN ('CREATED','PAID','REQUIREMENT_PENDING')`, orderUUID, p.UserID, normalized)
+	if err != nil {
+		return nil, fmt.Errorf("요구사항을 저장하지 못했습니다")
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, fmt.Errorf("요구사항을 갱신할 수 있는 주문이 아닙니다")
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		return nil, fmt.Errorf("요구사항을 저장하지 못했습니다")
+	}
+	s.audit(r, "order.requirements_update", "order", orderID, nil, normalized, "success")
 	result := map[string]any{"order_id": orderID, "updated": true}
 	text, _ := json.Marshal(result)
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": string(text)}}, "structuredContent": result}, nil

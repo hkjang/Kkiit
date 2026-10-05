@@ -5748,3 +5748,140 @@ func latestKeyCIDRs(t *testing.T, c *client) []string {
 	}
 	return got
 }
+
+// TestIntegrationMCPSubmitRequirementRunsTheOrderForm holds the MCP path to the
+// same order form contract the creation path enforces.
+//
+// Creating an order rejects a missing required answer, so every order starts
+// with a brief the seller can work from. submit_requirement overwrote that
+// column with whatever the agent sent, so an agent holding orders.buy could
+// empty the brief and the buyer's own payment would then hand the seller a
+// READY order with nothing in it.
+func TestIntegrationMCPSubmitRequirementRunsTheOrderForm(t *testing.T) {
+	server, pool := integrationServer(t)
+	_, talentID, _ := sellTalent(t, server, "mcpreqseller", uniqueName("요구사항검증")+" 서비스", 50_000)
+
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("mcpreqbuyer"))
+	created := buyer.do(http.MethodPost, "/api/v1/me/api-keys", map[string]any{
+		"name": "요구사항 에이전트", "scopes": []string{"mcp.use", "orders.buy"}, "allowed_cidrs": []string{}, "rate_limit_per_minute": 600,
+	}, http.StatusCreated)
+	agent := &mcpClient{t: t, base: server.URL, key: fmt.Sprint(created["secret"]), http: &http.Client{Timeout: 20 * time.Second}}
+
+	const brief = "판매자가 받은 원래 작업 지시"
+	order := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": brief}, "options": []any{},
+	}, http.StatusCreated)
+	orderID, _ := order["id"].(string)
+
+	// (1) Emptying a required answer must fail and leave the brief and the state
+	// exactly as they were.
+	message := agent.toolError("submit_requirement", map[string]any{"order_id": orderID, "requirements": map[string]any{}})
+	if !strings.Contains(message, "요구사항 항목을 입력해 주세요") {
+		t.Fatalf("빈 요구사항 제출 오류 메시지=%q", message)
+	}
+	state, stored := orderRequirements(t, pool, orderID)
+	if state != "CREATED" || stored["요구사항"] != brief {
+		t.Fatalf("거절된 제출 뒤 상태=%s 요구사항=%v", state, stored)
+	}
+
+	// A blank string is the same hole with a value in it.
+	agent.toolError("submit_requirement", map[string]any{"order_id": orderID, "requirements": map[string]any{"요구사항": "   "}})
+	if state, stored = orderRequirements(t, pool, orderID); state != "CREATED" || stored["요구사항"] != brief {
+		t.Fatalf("공백 제출 뒤 상태=%s 요구사항=%v", state, stored)
+	}
+
+	// A malformed identifier is a malformed identifier, not "no such order".
+	if bad := agent.toolError("submit_requirement", map[string]any{"order_id": "not-a-uuid", "requirements": map[string]any{"요구사항": "x"}}); !strings.Contains(bad, "uuid") {
+		t.Fatalf("잘못된 order_id 오류 메시지=%q", bad)
+	}
+
+	// (2) A complete answer still works and is stored under the seller's label
+	// the way createOrder stores it. The answer is keyed by requirement id here,
+	// which is the form the web client sends and which only normalisation can
+	// turn into a label; the key the seller never asked for is dropped.
+	var requirementID string
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM talent_requirements WHERE talent_id=$1`, talentID).Scan(&requirementID); err != nil {
+		t.Fatalf("requirement id: %v", err)
+	}
+	agent.tool("submit_requirement", map[string]any{"order_id": orderID, "requirements": map[string]any{
+		requirementID: "에이전트가 보낸 새 작업 지시", "판매자가 묻지 않은 항목": "버려져야 합니다",
+	}})
+	state, stored = orderRequirements(t, pool, orderID)
+	if state != "CREATED" {
+		t.Fatalf("정상 제출 뒤 상태=%s want=CREATED", state)
+	}
+	if len(stored) != 1 || stored["요구사항"] != "에이전트가 보낸 새 작업 지시" {
+		t.Fatalf("정상 제출 뒤 요구사항=%v want={요구사항:에이전트가 보낸 새 작업 지시}", stored)
+	}
+
+	// This is where the empty brief would have surfaced: paying moves the order
+	// to READY on its own, which tells the seller the form is done.
+	buyer.doWithHeaders(http.MethodPost, "/api/v1/orders/"+orderID+"/pay", map[string]any{}, http.StatusOK, map[string]string{"Idempotency-Key": uniqueName("pay")})
+	if state, stored = orderRequirements(t, pool, orderID); state != "READY" || stored["요구사항"] != "에이전트가 보낸 새 작업 지시" {
+		t.Fatalf("결제 뒤 상태=%s 요구사항=%v", state, stored)
+	}
+
+	// Once the order has left the form there is nothing to submit against.
+	if gone := agent.toolError("submit_requirement", map[string]any{"order_id": orderID, "requirements": map[string]any{"요구사항": "다시"}}); !strings.Contains(gone, "갱신할 수 있는 주문이 아닙니다") {
+		t.Fatalf("READY 주문 제출 오류 메시지=%q", gone)
+	}
+}
+
+// TestIntegrationMCPSubmitRequirementPromotesOnlyACompleteForm covers the one
+// branch of the tool that no HTTP route can set up: REQUIREMENT_PENDING, which
+// submit_requirement promotes to READY. Paying commits PAID and READY in a
+// single transaction (orders.go:332) and nothing else writes the state, so the
+// order is parked there directly. Everything after that is the real endpoint
+// and the real table.
+func TestIntegrationMCPSubmitRequirementPromotesOnlyACompleteForm(t *testing.T) {
+	server, pool := integrationServer(t)
+	_, talentID, _ := sellTalent(t, server, "mcppromoteseller", uniqueName("승격검증")+" 서비스", 40_000)
+
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("mcppromotebuyer"))
+	created := buyer.do(http.MethodPost, "/api/v1/me/api-keys", map[string]any{
+		"name": "승격 에이전트", "scopes": []string{"mcp.use", "orders.buy"}, "allowed_cidrs": []string{}, "rate_limit_per_minute": 600,
+	}, http.StatusCreated)
+	agent := &mcpClient{t: t, base: server.URL, key: fmt.Sprint(created["secret"]), http: &http.Client{Timeout: 20 * time.Second}}
+
+	const brief = "승격 전 작업 지시"
+	order := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": brief}, "options": []any{},
+	}, http.StatusCreated)
+	orderID, _ := order["id"].(string)
+	if _, err := pool.Exec(context.Background(), `UPDATE orders SET state='REQUIREMENT_PENDING' WHERE id=$1`, orderID); err != nil {
+		t.Fatalf("park order: %v", err)
+	}
+
+	// A rejected submission must not promote the order: READY means "the form is
+	// complete, you can start".
+	agent.toolError("submit_requirement", map[string]any{"order_id": orderID, "requirements": map[string]any{}})
+	state, stored := orderRequirements(t, pool, orderID)
+	if state != "REQUIREMENT_PENDING" || stored["요구사항"] != brief {
+		t.Fatalf("거절된 제출 뒤 상태=%s 요구사항=%v", state, stored)
+	}
+
+	// A complete submission still promotes it, as it always did.
+	agent.tool("submit_requirement", map[string]any{"order_id": orderID, "requirements": map[string]any{"요구사항": "승격 후 작업 지시"}})
+	if state, stored = orderRequirements(t, pool, orderID); state != "READY" || stored["요구사항"] != "승격 후 작업 지시" {
+		t.Fatalf("정상 제출 뒤 상태=%s 요구사항=%v want=READY", state, stored)
+	}
+}
+
+// orderRequirements reads the order's state and stored brief straight from the
+// table, so the assertions see what the seller will be handed rather than a
+// response the handler composed.
+func orderRequirements(t *testing.T, pool *pgxpool.Pool, orderID string) (string, map[string]string) {
+	t.Helper()
+	var state string
+	var raw map[string]any
+	if err := pool.QueryRow(context.Background(), `SELECT state,requirements FROM orders WHERE id=$1`, orderID).Scan(&state, &raw); err != nil {
+		t.Fatalf("order query: %v", err)
+	}
+	stored := make(map[string]string, len(raw))
+	for key, value := range raw {
+		stored[key] = fmt.Sprint(value)
+	}
+	return state, stored
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -79,6 +80,13 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	selectedOptions := make([]map[string]any, 0, len(optionIDs))
 	if len(optionIDs) > 0 {
+		// Neither validateTalent nor the table caps an add on's price, so a seller
+		// can list several that each fit in int64 but do not fit together. One wrap
+		// left a negative price, which the amount check on the orders table refused
+		// with an unexplained 500; two wraps left zero or a small positive number,
+		// and the order was committed at that amount. Refusing here keeps a wrapped
+		// amount out of the coupon, the budget reservation and the ledger alike.
+		amountOverflow := false
 		rows, optionErr := s.DB.Query(r.Context(), `SELECT id,name,price,additional_days FROM talent_options WHERE talent_id=$1 AND active AND id=ANY($2)`, in.TalentID, optionIDs)
 		if optionErr != nil {
 			writeError(w, 500, "query_failed", "추가 옵션을 확인하지 못했습니다.")
@@ -92,11 +100,21 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 			if rows.Scan(&optionID, &name, &optionPrice, &extraDays) != nil {
 				continue
 			}
+			// Flagged rather than returned: this loop owns an open pgx row set that
+			// rows.Close below releases, and leaving early would abandon it.
+			if optionPrice > math.MaxInt64-price {
+				amountOverflow = true
+				continue
+			}
 			price += optionPrice
 			days += extraDays
 			selectedOptions = append(selectedOptions, map[string]any{"id": optionID, "name": name, "price": optionPrice, "additional_days": extraDays})
 		}
 		rows.Close()
+		if amountOverflow {
+			writeError(w, 400, "order_amount_too_large", "선택한 추가 옵션을 더한 금액이 주문할 수 있는 한도를 넘습니다. 옵션을 줄여 주세요.")
+			return
+		}
 		if len(selectedOptions) != len(optionIDs) {
 			writeError(w, 400, "invalid_option", "선택한 추가 옵션 중 판매 중이 아닌 항목이 있습니다.")
 			return

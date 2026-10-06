@@ -497,11 +497,14 @@ paths:
         '200': { description: orders with next_cursor }
     post:
       summary: 공개 상품 주문
-      description: 판매자가 정의한 주문 양식을 서버에서 검증한다. 필수 항목이 비어 있으면 400을 돌려주며, 답변은 요구사항 id 또는 label 어느 쪽으로 보내도 되고 저장은 항상 label 기준이다. 양식에 없는 항목은 저장하지 않는다.
+      description: 판매자가 정의한 주문 양식을 서버에서 검증한다. 필수 항목이 비어 있으면 400을 돌려주며, 답변은 요구사항 id 또는 label 어느 쪽으로 보내도 되고 저장은 항상 label 기준이다. 양식에 없는 항목은 저장하지 않는다. 추가 옵션 가격은 상품에 등록된 값으로만 더하며, 합계가 표현할 수 있는 범위를 넘으면 `order_amount_too_large` 400으로 거절한다.
       responses:
         '201': { description: created order }
         '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
   /orders/{id}:
     get:
       summary: 주문 Workspace 데이터와 Timeline

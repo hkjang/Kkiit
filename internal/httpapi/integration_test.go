@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
@@ -5884,4 +5885,149 @@ func orderRequirements(t *testing.T, pool *pgxpool.Pool, orderID string) (string
 		stored[key] = fmt.Sprint(value)
 	}
 	return state, stored
+}
+
+// publishTalentWithOptions registers a seller whose published talent carries one
+// add on per price listed, and returns the seller, the talent and the add on
+// identifiers in that same order. sellTalent registers no add ons at all, and
+// createOrder reads their prices from the product rather than from the request,
+// so a test about add on arithmetic has to plant them on a product first.
+func publishTalentWithOptions(t *testing.T, server *httptest.Server, pool *pgxpool.Pool, prefix string, basePrice int64, optionPrices []int64, extraDays int) (*client, string, []map[string]any) {
+	t.Helper()
+	title := prefix + " 추가 옵션 상품"
+	seller := newClient(t, server.URL)
+	seller.register(uniqueName(prefix))
+	seller.do(http.MethodPut, "/api/v1/me/seller-profile", map[string]any{
+		"seller_type": "individual", "headline": title, "biography": "", "skills": []string{"go"}, "capacity": 5, "settings": map[string]any{},
+	}, http.StatusOK)
+	options := make([]map[string]any, 0, len(optionPrices))
+	for index, optionPrice := range optionPrices {
+		options = append(options, map[string]any{
+			"name": fmt.Sprintf("추가 옵션 %d", index+1), "description": "", "price": optionPrice,
+			"additional_days": extraDays, "sort_order": index, "active": true,
+		})
+	}
+	talent := seller.do(http.MethodPost, "/api/v1/talents", map[string]any{
+		"title": title, "summary": title, "description": title + " 상세 설명입니다.",
+		"service_type": "HUMAN", "base_price": basePrice, "delivery_days": 3, "currency": "KRW", "revision_count": 1,
+		"scope_included": []string{}, "scope_excluded": []string{}, "deliverables": []string{}, "tags": []string{"test"},
+		"faq": []any{}, "refund_policy": "전액 환불", "instant_order": true, "quote_required": false, "subscription_enabled": false,
+		"packages":     []map[string]any{},
+		"options":      options,
+		"requirements": []map[string]any{{"label": "요구사항", "help_text": "", "field_type": "textarea", "required": true, "options": []any{}, "validation": map[string]any{}, "sort_order": 0}},
+	}, http.StatusCreated)
+	talentID, _ := talent["id"].(string)
+	if talentID == "" {
+		t.Fatal("상품 식별자가 없습니다")
+	}
+	if published := seller.do(http.MethodPost, "/api/v1/talents/"+talentID+"/publish", nil, http.StatusOK); published["status"] != "published" {
+		t.Fatalf("상품이 공개되지 않았습니다: %v", published)
+	}
+	// An order names add ons by the identifier the product carries, and the
+	// response to POST /talents only returns the talent's own id.
+	rows, err := pool.Query(context.Background(), `SELECT id FROM talent_options WHERE talent_id=$1 AND active ORDER BY sort_order`, talentID)
+	if err != nil {
+		t.Fatalf("option query: %v", err)
+	}
+	defer rows.Close()
+	refs := make([]map[string]any, 0, len(optionPrices))
+	for rows.Next() {
+		var optionID uuid.UUID
+		if err := rows.Scan(&optionID); err != nil {
+			t.Fatalf("option scan: %v", err)
+		}
+		refs = append(refs, map[string]any{"id": optionID.String()})
+	}
+	if len(refs) != len(optionPrices) {
+		t.Fatalf("등록된 추가 옵션 %d개, 기대 %d개", len(refs), len(optionPrices))
+	}
+	return seller, talentID, refs
+}
+
+// storedOrderAmount reads the committed amount as an int64. client.do decodes JSON
+// numbers into float64, which cannot hold amounts near the int64 limit.
+func storedOrderAmount(t *testing.T, pool *pgxpool.Pool, orderID string) int64 {
+	t.Helper()
+	var amount int64
+	if err := pool.QueryRow(context.Background(), `SELECT amount FROM orders WHERE id=$1`, orderID).Scan(&amount); err != nil {
+		t.Fatalf("amount query: %v", err)
+	}
+	return amount
+}
+
+// An add on total that does not fit in int64 has to be refused before anything
+// is written. Four add ons at 2^62 sum to 2^64, which wrapped twice and left
+// price at 0, so the order was committed at an amount nobody agreed to: the
+// orders row, the timeline entry and the audit record all carried that zero.
+func TestIntegrationOrderRejectsOptionTotalPastInt64(t *testing.T) {
+	server, pool := integrationServer(t)
+	const huge = int64(1) << 62
+	_, talentID, optionRefs := publishTalentWithOptions(t, server, pool, "ovfseller", 0, []int64{huge, huge, huge, huge}, 0)
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("ovfbuyer"))
+
+	rejected := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": "검증"}, "options": optionRefs,
+	}, http.StatusBadRequest)
+	if code := errorCode(rejected); code != "order_amount_too_large" {
+		t.Fatalf("거절 코드=%q want=order_amount_too_large", code)
+	}
+
+	// The status code is not the damage; a wrapped amount reaching the tables is.
+	var orders, timeline, redemptions int
+	if err := pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM orders WHERE talent_id=$1),
+		(SELECT count(*) FROM order_timeline tl JOIN orders o ON o.id=tl.order_id WHERE o.talent_id=$1),
+		(SELECT count(*) FROM coupon_redemptions cr JOIN orders o ON o.id=cr.order_id WHERE o.talent_id=$1)`, talentID).Scan(&orders, &timeline, &redemptions); err != nil {
+		t.Fatalf("order count: %v", err)
+	}
+	if orders != 0 || timeline != 0 || redemptions != 0 {
+		t.Fatalf("거절된 주문이 흔적을 남겼습니다: orders=%d timeline=%d redemptions=%d", orders, timeline, redemptions)
+	}
+}
+
+// Exactly math.MaxInt64 is a representable amount, so the guard must let it
+// through. An off by one here would refuse the largest order the tables accept.
+func TestIntegrationOrderAcceptsOptionTotalAtInt64Limit(t *testing.T) {
+	server, pool := integrationServer(t)
+	_, talentID, optionRefs := publishTalentWithOptions(t, server, pool, "limitseller", 0, []int64{int64(1) << 62, (int64(1) << 62) - 1}, 0)
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("limitbuyer"))
+
+	order := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": "검증"}, "options": optionRefs,
+	}, http.StatusCreated)
+	orderID, _ := order["id"].(string)
+	if amount := storedOrderAmount(t, pool, orderID); amount != math.MaxInt64 {
+		t.Fatalf("주문 금액=%d want=%d", amount, int64(math.MaxInt64))
+	}
+}
+
+// The ordinary path the guard must leave alone: add on prices and days still add
+// to the product's own. sellTalent registers no add ons, so nothing else in this
+// package covers the summing loop at all.
+func TestIntegrationOrderAddsOrdinaryOptionPricesAndDays(t *testing.T) {
+	server, pool := integrationServer(t)
+	_, talentID, optionRefs := publishTalentWithOptions(t, server, pool, "optseller", 100_000, []int64{20_000, 5_000}, 2)
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("optbuyer"))
+
+	order := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": "검증"}, "options": optionRefs,
+	}, http.StatusCreated)
+	if amount, want := order["amount"], float64(125_000); amount != want {
+		t.Fatalf("응답 금액=%v want=%v", amount, want)
+	}
+	orderID, _ := order["id"].(string)
+	if amount := storedOrderAmount(t, pool, orderID); amount != 125_000 {
+		t.Fatalf("저장된 금액=%d want=125000", amount)
+	}
+	// Three days for the product plus two for each of the two add ons.
+	var days int
+	if err := pool.QueryRow(context.Background(), `SELECT due_at::date - created_at::date FROM orders WHERE id=$1`, orderID).Scan(&days); err != nil {
+		t.Fatalf("due query: %v", err)
+	}
+	if days != 7 {
+		t.Fatalf("납기 일수=%d want=7", days)
+	}
 }

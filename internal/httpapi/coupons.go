@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -144,9 +145,10 @@ func resolveCoupon(ctx context.Context, tx pgx.Tx, code string, buyer uuid.UUID,
 func (s *Server) previewCoupon(w http.ResponseWriter, r *http.Request) {
 	p, _ := principalFrom(r.Context())
 	var in struct {
-		Code      string     `json:"code"`
-		TalentID  uuid.UUID  `json:"talent_id"`
-		PackageID *uuid.UUID `json:"package_id,omitempty"`
+		Code      string           `json:"code"`
+		TalentID  uuid.UUID        `json:"talent_id"`
+		PackageID *uuid.UUID       `json:"package_id,omitempty"`
+		Options   []map[string]any `json:"options,omitempty"`
 	}
 	if !decodeJSON(w, r, &in) {
 		return
@@ -164,6 +166,11 @@ func (s *Server) previewCoupon(w http.ResponseWriter, r *http.Request) {
 	amount, err := orderAmount(r.Context(), tx, in.TalentID, in.PackageID)
 	if err != nil {
 		writeError(w, 404, "talent_not_found", "공개된 상품을 찾을 수 없습니다.")
+		return
+	}
+	amount, failure, message, ok := addSelectedOptions(r.Context(), tx, in.TalentID, in.Options, amount)
+	if !ok {
+		writeError(w, 400, failure, message)
 		return
 	}
 	coupon, message, ok := resolveCoupon(r.Context(), tx, in.Code, p.UserID, amount)
@@ -190,6 +197,67 @@ func orderAmount(ctx context.Context, tx pgx.Tx, talentID uuid.UUID, packageID *
 		amount = packagePrice
 	}
 	return amount, nil
+}
+
+// addSelectedOptions adds the add ons the buyer picked to a base amount, using
+// the prices the product carries rather than anything the request names. The
+// preview claims to apply the rules the order will apply, and until this existed
+// it applied them to the product price alone: a buyer who had ticked add ons was
+// quoted a discount on a smaller amount than the order would charge a moment
+// later, and a coupon whose floor the full basket cleared came back refused.
+//
+// createOrder runs the same three rules over the same table a few lines of its
+// own, and this deliberately repeats them instead of extracting a shared helper.
+// That loop sits in the middle of the function that writes the order amount, the
+// budget reservation and the ledger, which is the most consequential code in the
+// package; a read only caller is not worth reshaping it for. The two must stay in
+// step, and the integration tests compare a preview against a real order to say
+// so when they drift.
+//
+// The failure code and message are the order's, so the buyer reads one wording
+// whichever call they hit first.
+func addSelectedOptions(ctx context.Context, tx pgx.Tx, talentID uuid.UUID, options []map[string]any, amount int64) (int64, string, string, bool) {
+	if len(options) == 0 {
+		return amount, "", "", true
+	}
+	optionIDs := make([]uuid.UUID, 0, len(options))
+	for _, option := range options {
+		raw, _ := option["id"].(string)
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			return 0, "invalid_option", "추가 옵션은 상품에 등록된 옵션 식별자로 지정해 주세요.", false
+		}
+		optionIDs = append(optionIDs, parsed)
+	}
+	rows, err := tx.Query(ctx, `SELECT id,price FROM talent_options WHERE talent_id=$1 AND active AND id=ANY($2)`, talentID, optionIDs)
+	if err != nil {
+		return 0, "query_failed", "추가 옵션을 확인하지 못했습니다.", false
+	}
+	// Flagged rather than returned: this loop owns an open pgx row set that
+	// rows.Close below releases, and leaving early would abandon it.
+	overflow := false
+	found := 0
+	for rows.Next() {
+		var optionID uuid.UUID
+		var optionPrice int64
+		if rows.Scan(&optionID, &optionPrice) != nil {
+			continue
+		}
+		found++
+		if optionPrice > math.MaxInt64-amount {
+			overflow = true
+			continue
+		}
+		amount += optionPrice
+	}
+	rows.Close()
+	if overflow {
+		return 0, "order_amount_too_large", "선택한 추가 옵션을 더한 금액이 주문할 수 있는 한도를 넘습니다. 옵션을 줄여 주세요.", false
+	}
+	if found != len(optionIDs) {
+		return 0, "invalid_option", "선택한 추가 옵션 중 판매 중이 아닌 항목이 있습니다.", false
+	}
+	return amount, "", "", true
 }
 
 type couponInput struct {

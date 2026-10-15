@@ -6031,3 +6031,131 @@ func TestIntegrationOrderAddsOrdinaryOptionPricesAndDays(t *testing.T) {
 		t.Fatalf("납기 일수=%d want=7", days)
 	}
 }
+
+// couponAmounts pulls the three money fields a coupon response carries so a
+// preview and an order can be compared as one value instead of three.
+func couponAmounts(t *testing.T, body map[string]any) [3]float64 {
+	t.Helper()
+	amount, okAmount := body["amount"].(float64)
+	discount, okDiscount := body["discount_amount"].(float64)
+	payable, okPayable := body["payable_amount"].(float64)
+	if !okAmount || !okDiscount || !okPayable {
+		t.Fatalf("금액 필드가 없습니다: %v", body)
+	}
+	return [3]float64{amount, discount, payable}
+}
+
+// The preview promises the price the order will charge, so it has to count the
+// add ons the buyer picked. It used to price the product alone, which quoted a
+// buyer who had chosen add ons a cheaper order than the one the button created.
+func TestIntegrationCouponPreviewCountsSelectedOptionsLikeTheOrder(t *testing.T) {
+	server, pool := integrationServer(t)
+	operator := operatorClient(t, server, pool, "optcouponop")
+	code := strings.ToUpper(uniqueName("OPTSAVE"))
+	operator.do(http.MethodPost, "/api/v1/admin/coupons", map[string]any{
+		"code": code, "name": "추가 옵션 포함 할인", "discount_type": "percent", "discount_value": 25,
+		"min_order_amount": 0, "per_user_limit": 1, "active": true,
+	}, http.StatusCreated)
+
+	// 100,000 + 20,000 + 8,000 = 128,000; a quarter of that is 32,000, while a
+	// quarter of the base price alone would be 25,000. The two cannot be confused.
+	_, talentID, optionRefs := publishTalentWithOptions(t, server, pool, "optcouponseller", 100_000, []int64{20_000, 8_000}, 0)
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("optcouponbuyer"))
+
+	preview := buyer.do(http.MethodPost, "/api/v1/coupons/preview", map[string]any{
+		"code": code, "talent_id": talentID, "options": optionRefs,
+	}, http.StatusOK)
+	if got, want := couponAmounts(t, preview), [3]float64{128_000, 32_000, 96_000}; got != want {
+		t.Fatalf("미리보기 금액=%v want=%v (본문 %v)", got, want, preview)
+	}
+
+	order := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": "검증"}, "options": optionRefs, "coupon_code": code,
+	}, http.StatusCreated)
+	if got, want := couponAmounts(t, order), couponAmounts(t, preview); got != want {
+		t.Fatalf("주문 금액=%v, 미리보기 금액=%v", got, want)
+	}
+}
+
+// A coupon whose floor sits above the base price but below the price with add
+// ons is usable, and the preview said otherwise: the buyer was told a coupon
+// they could spend was not applicable to their order.
+func TestIntegrationCouponPreviewAppliesMinOrderAmountToTheOptionTotal(t *testing.T) {
+	server, pool := integrationServer(t)
+	operator := operatorClient(t, server, pool, "minoptop")
+	code := strings.ToUpper(uniqueName("MINOPT"))
+	operator.do(http.MethodPost, "/api/v1/admin/coupons", map[string]any{
+		"code": code, "name": "최소 주문 금액 검증", "discount_type": "percent", "discount_value": 10,
+		"min_order_amount": 120_000, "per_user_limit": 1, "active": true,
+	}, http.StatusCreated)
+
+	// The floor falls between 100,000 and 130,000.
+	_, talentID, optionRefs := publishTalentWithOptions(t, server, pool, "minoptseller", 100_000, []int64{30_000}, 0)
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("minoptbuyer"))
+
+	preview := buyer.do(http.MethodPost, "/api/v1/coupons/preview", map[string]any{
+		"code": code, "talent_id": talentID, "options": optionRefs,
+	}, http.StatusOK)
+	if got, want := couponAmounts(t, preview), [3]float64{130_000, 13_000, 117_000}; got != want {
+		t.Fatalf("미리보기 금액=%v want=%v (본문 %v)", got, want, preview)
+	}
+
+	order := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": "검증"}, "options": optionRefs, "coupon_code": code,
+	}, http.StatusCreated)
+	if got, want := couponAmounts(t, order), couponAmounts(t, preview); got != want {
+		t.Fatalf("주문 금액=%v, 미리보기 금액=%v", got, want)
+	}
+}
+
+// Whatever the order refuses the preview has to refuse the same way, or the
+// form shows a price for a basket that can never be bought.
+func TestIntegrationCouponPreviewRejectsOptionsTheOrderWouldReject(t *testing.T) {
+	server, pool := integrationServer(t)
+	operator := operatorClient(t, server, pool, "badoptop")
+	code := strings.ToUpper(uniqueName("BADOPT"))
+	operator.do(http.MethodPost, "/api/v1/admin/coupons", map[string]any{
+		"code": code, "name": "옵션 거절 검증", "discount_type": "fixed", "discount_value": 1_000,
+		"min_order_amount": 0, "per_user_limit": 5, "active": true,
+	}, http.StatusCreated)
+
+	const huge = int64(1) << 62
+	_, talentID, optionRefs := publishTalentWithOptions(t, server, pool, "badoptseller", 0, []int64{huge, huge, huge, huge}, 0)
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("badoptbuyer"))
+
+	unknown := buyer.do(http.MethodPost, "/api/v1/coupons/preview", map[string]any{
+		"code": code, "talent_id": talentID, "options": []map[string]any{{"id": uuid.NewString()}},
+	}, http.StatusBadRequest)
+	if got := errorCode(unknown); got != "invalid_option" {
+		t.Fatalf("없는 옵션 거절 코드=%q want=invalid_option", got)
+	}
+
+	malformed := buyer.do(http.MethodPost, "/api/v1/coupons/preview", map[string]any{
+		"code": code, "talent_id": talentID, "options": []map[string]any{{"id": "not-a-uuid"}},
+	}, http.StatusBadRequest)
+	if got := errorCode(malformed); got != "invalid_option" {
+		t.Fatalf("식별자 형식 거절 코드=%q want=invalid_option", got)
+	}
+
+	overflow := buyer.do(http.MethodPost, "/api/v1/coupons/preview", map[string]any{
+		"code": code, "talent_id": talentID, "options": optionRefs,
+	}, http.StatusBadRequest)
+	if got := errorCode(overflow); got != "order_amount_too_large" {
+		t.Fatalf("합계 초과 거절 코드=%q want=order_amount_too_large", got)
+	}
+
+	// An add on the seller has stopped selling is as absent as one that never
+	// existed, and the order already treats it that way.
+	if _, err := pool.Exec(context.Background(), `UPDATE talent_options SET active=false WHERE id=$1`, optionRefs[0]["id"]); err != nil {
+		t.Fatalf("옵션 중단: %v", err)
+	}
+	stopped := buyer.do(http.MethodPost, "/api/v1/coupons/preview", map[string]any{
+		"code": code, "talent_id": talentID, "options": optionRefs[:1],
+	}, http.StatusBadRequest)
+	if got := errorCode(stopped); got != "invalid_option" {
+		t.Fatalf("중단된 옵션 거절 코드=%q want=invalid_option", got)
+	}
+}

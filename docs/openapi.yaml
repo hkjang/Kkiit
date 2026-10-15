@@ -824,7 +824,14 @@ paths:
   /coupons/preview:
     post:
       summary: 쿠폰 적용 미리보기
-      description: 주문에 적용될 실제 할인액을 주문 생성과 동일한 규칙으로 계산한다.
+      description: >-
+        주문에 적용될 실제 할인액을 주문 생성과 동일한 규칙으로 계산한다. 선택한 추가 옵션을
+        POST /orders 와 같은 모양으로 함께 보내면 그 가격까지 합한 금액에 쿠폰을 적용하므로,
+        응답의 amount·discount_amount·payable_amount 는 같은 구성으로 만든 주문과 일치한다.
+        options 를 생략하면 상품 기본가 또는 선택한 패키지 가격만 집계한다.
+        400 은 code_required, invalid_json 과, 주문 생성과 같은 기준의 invalid_option
+        (상품에 없거나 판매 중이 아닌 추가 옵션) 및 order_amount_too_large
+        (추가 옵션을 더한 금액이 int64 한도를 넘음) 이다.
       requestBody:
         required: true
         content:
@@ -836,9 +843,20 @@ paths:
                 code: { type: string }
                 talent_id: { type: string, format: uuid }
                 package_id: { type: string, format: uuid }
+                options:
+                  type: array
+                  description: 선택한 추가 옵션. 가격은 상품에 등록된 값을 쓰고 요청에 적힌 값은 무시한다.
+                  items:
+                    type: object
+                    required: [id]
+                    properties:
+                      id: { type: string, format: uuid }
       responses:
         '200': { description: discount and payable amount }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /quotes/{id}/accept:
     post:
       summary: 견적 선택과 주문 생성

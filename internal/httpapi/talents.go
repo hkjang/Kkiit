@@ -546,6 +546,18 @@ func (s *Server) saveTalent(r *http.Request, p Principal, id uuid.UUID, in talen
 	return tx.Commit(r.Context())
 }
 
+// getTalent answers two audiences from one row, and the packages and add ons
+// have to be filtered differently for each. A buyer uses this response to choose
+// what to order, so listing a package whose active flag is off hands them a
+// dead end: the dropdown prices the form from it and then the order refuses it
+// with package_not_available, while the coupon preview reports 404 on a product
+// that is published and on sale. The seller and the operator use the same
+// response to edit, and PUT /talents replaces packages, options and
+// requirements with exactly what it is sent — so anything held back from them
+// is deleted the next time they change a title. Add ons used to be filtered for
+// everyone, which is that second failure, and packages for nobody, which is the
+// first. The owner and the operator now see all of both; everyone else sees
+// only what the order will take.
 func (s *Server) getTalent(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseUUIDPath(w, r, "id")
 	if !ok {
@@ -553,7 +565,7 @@ func (s *Server) getTalent(w http.ResponseWriter, r *http.Request) {
 	}
 	var result map[string]any
 	var raw []byte
-	err := s.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('id',t.id,'seller_id',t.seller_id,'category_id',t.category_id,'category',(SELECT jsonb_build_object('slug',c.slug,'name',c.name) FROM categories c WHERE c.id=t.category_id),'title',t.title,'slug',t.slug,'summary',t.summary,'description',t.description,'status',t.status,'service_type',t.service_type,'base_price',t.base_price,'currency',t.currency,'delivery_days',t.delivery_days,'revision_count',t.revision_count,'scope_included',t.scope_included,'scope_excluded',t.scope_excluded,'deliverables',t.deliverables,'tags',t.tags,'faq',t.faq,'refund_policy',t.refund_policy,'instant_order',t.instant_order,'quote_required',t.quote_required,'subscription_enabled',t.subscription_enabled,'quality_score',t.quality_score,'favorite_count',(SELECT count(*) FROM favorites f WHERE f.talent_id=t.id),'favorited',($2::uuid IS NOT NULL AND EXISTS(SELECT 1 FROM favorites f WHERE f.talent_id=t.id AND f.user_id=$2)),'accepting_orders',(COALESCE(sp.capacity,0)<=0 OR (SELECT count(*) FROM orders o WHERE o.seller_id=t.seller_id AND o.state NOT IN ('COMPLETED','CANCELLED','REFUNDED'))<COALESCE(sp.capacity,0)),'seller',jsonb_build_object('id',u.id,'display_name',u.display_name,'level',COALESCE(sp.level,'NEW'),'score',COALESCE(sp.score,0),'rating',COALESCE(sp.rating,0),'rating_count',COALESCE(sp.rating_count,0),'headline',COALESCE(sp.headline,'')),'packages',COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.sort_order) FROM talent_packages p WHERE p.talent_id=t.id),'[]'::jsonb),'options',COALESCE((SELECT jsonb_agg(to_jsonb(o) ORDER BY o.sort_order) FROM talent_options o WHERE o.talent_id=t.id AND o.active),'[]'::jsonb),'requirements',COALESCE((SELECT jsonb_agg(to_jsonb(q) ORDER BY q.sort_order) FROM talent_requirements q WHERE q.talent_id=t.id),'[]'::jsonb)) FROM talents t JOIN users u ON u.id=t.seller_id LEFT JOIN seller_profiles sp ON sp.user_id=t.seller_id WHERE t.id=$1 AND ((t.status='published' AND u.status='active') OR t.seller_id=$2 OR $3)`, id, principalID(r), principalHas(r, "orders.manage")).Scan(&raw)
+	err := s.DB.QueryRow(r.Context(), `SELECT jsonb_build_object('id',t.id,'seller_id',t.seller_id,'category_id',t.category_id,'category',(SELECT jsonb_build_object('slug',c.slug,'name',c.name) FROM categories c WHERE c.id=t.category_id),'title',t.title,'slug',t.slug,'summary',t.summary,'description',t.description,'status',t.status,'service_type',t.service_type,'base_price',t.base_price,'currency',t.currency,'delivery_days',t.delivery_days,'revision_count',t.revision_count,'scope_included',t.scope_included,'scope_excluded',t.scope_excluded,'deliverables',t.deliverables,'tags',t.tags,'faq',t.faq,'refund_policy',t.refund_policy,'instant_order',t.instant_order,'quote_required',t.quote_required,'subscription_enabled',t.subscription_enabled,'quality_score',t.quality_score,'favorite_count',(SELECT count(*) FROM favorites f WHERE f.talent_id=t.id),'favorited',($2::uuid IS NOT NULL AND EXISTS(SELECT 1 FROM favorites f WHERE f.talent_id=t.id AND f.user_id=$2)),'accepting_orders',(COALESCE(sp.capacity,0)<=0 OR (SELECT count(*) FROM orders o WHERE o.seller_id=t.seller_id AND o.state NOT IN ('COMPLETED','CANCELLED','REFUNDED'))<COALESCE(sp.capacity,0)),'seller',jsonb_build_object('id',u.id,'display_name',u.display_name,'level',COALESCE(sp.level,'NEW'),'score',COALESCE(sp.score,0),'rating',COALESCE(sp.rating,0),'rating_count',COALESCE(sp.rating_count,0),'headline',COALESCE(sp.headline,'')),'packages',COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.sort_order) FROM talent_packages p WHERE p.talent_id=t.id AND (p.active OR t.seller_id=$2 OR $3)),'[]'::jsonb),'options',COALESCE((SELECT jsonb_agg(to_jsonb(o) ORDER BY o.sort_order) FROM talent_options o WHERE o.talent_id=t.id AND (o.active OR t.seller_id=$2 OR $3)),'[]'::jsonb),'requirements',COALESCE((SELECT jsonb_agg(to_jsonb(q) ORDER BY q.sort_order) FROM talent_requirements q WHERE q.talent_id=t.id),'[]'::jsonb)) FROM talents t JOIN users u ON u.id=t.seller_id LEFT JOIN seller_profiles sp ON sp.user_id=t.seller_id WHERE t.id=$1 AND ((t.status='published' AND u.status='active') OR t.seller_id=$2 OR $3)`, id, principalID(r), principalHas(r, "orders.manage")).Scan(&raw)
 	if err != nil {
 		writeError(w, 404, "not_found", "상품을 찾을 수 없습니다.")
 		return

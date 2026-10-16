@@ -420,9 +420,15 @@ paths:
     get:
       security: []
       summary: 재능 상세
+      description: |
+        `packages`와 `options`는 보는 사람에 따라 달라진다. 판매자 본인과 `orders.manage` 권한자는
+        `active=false`인 항목까지 모두 받는다 — PUT /talents/{id}가 `packages`·`options`·`requirements`를
+        보낸 그대로 교체하므로, 편집 화면이 받지 못한 항목은 다음 저장에서 삭제된다. 그 밖의 뷰어는 주문할 수 있는
+        `active=true` 항목만 받는다. 공개되지 않은 상품은 판매자 본인과 권한자에게만 보이며 그 외에는 404다.
       parameters: [{ $ref: '#/components/parameters/Id' }]
       responses:
         '200': { description: talent detail }
+        '404': { $ref: '#/components/responses/Error' }
     put:
       summary: 본인 재능 상품 변경
       parameters: [{ $ref: '#/components/parameters/Id' }]

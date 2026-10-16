@@ -6159,3 +6159,107 @@ func TestIntegrationCouponPreviewRejectsOptionsTheOrderWouldReject(t *testing.T)
 		t.Fatalf("중단된 옵션 거절 코드=%q want=invalid_option", got)
 	}
 }
+
+// childIDs lists the identifiers of one of the product detail's nested
+// collections, in the order the response carries them.
+func childIDs(t *testing.T, body map[string]any, key string) []string {
+	t.Helper()
+	raw, ok := body[key].([]any)
+	if !ok {
+		t.Fatalf("%s 목록이 없습니다: %v", key, body[key])
+	}
+	ids := make([]string, 0, len(raw))
+	for _, item := range raw {
+		entry, isObject := item.(map[string]any)
+		if !isObject {
+			t.Fatalf("%s 항목 형식이 다릅니다: %v", key, item)
+		}
+		id, _ := entry["id"].(string)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// The product page is the only place a buyer picks a package or an add on, so
+// what it lists has to be what the order accepts. Packages were listed whatever
+// their active flag said: a package the seller had stopped selling stayed in the
+// buyer's dropdown, priced the form, and then the order refused it with
+// package_not_available while the coupon preview answered 404 for a product that
+// is published and on sale. Add ons were filtered, which broke the other side —
+// the seller's own edit screen reads this same response and writes it back
+// wholesale, so an add on it could not see was deleted the next time the seller
+// changed a title. Who is looking decides: a buyer sees what they can order, and
+// the seller and the operator see everything they own.
+func TestIntegrationTalentDetailShowsBuyersOnlyOrderablePackagesAndOptions(t *testing.T) {
+	server, pool := integrationServer(t)
+	seller := registerSeller(t, server, "shelflife")
+	livePackage, retiredPackage := uuid.New(), uuid.New()
+	liveOption, retiredOption := uuid.New(), uuid.New()
+	title := uniqueName("판매 중단 구성 상품")
+	talent := seller.do(http.MethodPost, "/api/v1/talents", map[string]any{
+		"title": title, "summary": title, "description": title + " 상세 설명입니다.",
+		"service_type": "HUMAN", "base_price": 100_000, "delivery_days": 3, "currency": "KRW", "revision_count": 1,
+		"scope_included": []string{}, "scope_excluded": []string{}, "deliverables": []string{}, "tags": []string{"test"},
+		"faq": []any{}, "refund_policy": "전액 환불", "instant_order": true, "quote_required": false, "subscription_enabled": false,
+		"packages": []map[string]any{
+			{"id": livePackage, "package_type": "BASIC", "name": "판매 중", "description": "", "price": 100_000,
+				"delivery_days": 3, "revision_count": 1, "features": []string{}, "deliverables": []string{}, "sort_order": 0, "active": true},
+			{"id": retiredPackage, "package_type": "PREMIUM", "name": "판매 중단", "description": "", "price": 900_000,
+				"delivery_days": 7, "revision_count": 3, "features": []string{}, "deliverables": []string{}, "sort_order": 1, "active": false},
+		},
+		"options": []map[string]any{
+			{"id": liveOption, "name": "판매 중 옵션", "description": "", "price": 20_000, "additional_days": 0, "sort_order": 0, "active": true},
+			{"id": retiredOption, "name": "판매 중단 옵션", "description": "", "price": 30_000, "additional_days": 0, "sort_order": 1, "active": false},
+		},
+		"requirements": []map[string]any{{"label": "요구사항", "help_text": "", "field_type": "textarea", "required": true, "options": []any{}, "validation": map[string]any{}, "sort_order": 0}},
+	}, http.StatusCreated)
+	talentID, _ := talent["id"].(string)
+	if talentID == "" {
+		t.Fatal("상품 식별자가 없습니다")
+	}
+	seller.do(http.MethodPost, "/api/v1/talents/"+talentID+"/publish", nil, http.StatusOK)
+
+	buyer := newClient(t, server.URL)
+	buyer.register(uniqueName("shelfbuyer"))
+	detail := buyer.do(http.MethodGet, "/api/v1/talents/"+talentID, nil, http.StatusOK)
+	if got, want := childIDs(t, detail, "packages"), []string{livePackage.String()}; !slices.Equal(got, want) {
+		t.Fatalf("구매자가 본 패키지=%v want=%v", got, want)
+	}
+	if got, want := childIDs(t, detail, "options"), []string{liveOption.String()}; !slices.Equal(got, want) {
+		t.Fatalf("구매자가 본 추가 옵션=%v want=%v", got, want)
+	}
+
+	// The seller edits by sending this response back, so anything missing from it
+	// is dropped from the product.
+	own := seller.do(http.MethodGet, "/api/v1/talents/"+talentID, nil, http.StatusOK)
+	if got, want := childIDs(t, own, "packages"), []string{livePackage.String(), retiredPackage.String()}; !slices.Equal(got, want) {
+		t.Fatalf("판매자가 본 패키지=%v want=%v", got, want)
+	}
+	if got, want := childIDs(t, own, "options"), []string{liveOption.String(), retiredOption.String()}; !slices.Equal(got, want) {
+		t.Fatalf("판매자가 본 추가 옵션=%v want=%v", got, want)
+	}
+	// An operator answering a question about this product sees it as the seller
+	// does, which is the same test the rest of this response already applies.
+	operator := operatorClient(t, server, pool, "shelfoperator")
+	audited := operator.do(http.MethodGet, "/api/v1/talents/"+talentID, nil, http.StatusOK)
+	if got, want := childIDs(t, audited, "packages"), []string{livePackage.String(), retiredPackage.String()}; !slices.Equal(got, want) {
+		t.Fatalf("운영자가 본 패키지=%v want=%v", got, want)
+	}
+	if got, want := childIDs(t, audited, "options"), []string{liveOption.String(), retiredOption.String()}; !slices.Equal(got, want) {
+		t.Fatalf("운영자가 본 추가 옵션=%v want=%v", got, want)
+	}
+
+	// Why the buyer must not see them: both are dead ends on the order itself.
+	refusedPackage := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "package_id": retiredPackage, "requirements": map[string]any{"요구사항": "검증"}, "options": []any{},
+	}, http.StatusBadRequest)
+	if got := errorCode(refusedPackage); got != "package_not_available" {
+		t.Fatalf("판매 중단 패키지 주문 거절 코드=%q want=package_not_available", got)
+	}
+	refusedOption := buyer.do(http.MethodPost, "/api/v1/orders", map[string]any{
+		"talent_id": talentID, "requirements": map[string]any{"요구사항": "검증"}, "options": []map[string]any{{"id": retiredOption}},
+	}, http.StatusBadRequest)
+	if got := errorCode(refusedOption); got != "invalid_option" {
+		t.Fatalf("판매 중단 옵션 주문 거절 코드=%q want=invalid_option", got)
+	}
+}

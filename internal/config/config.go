@@ -10,8 +10,9 @@ import (
 	"strings"
 )
 
-// Config intentionally exposes only the four bootstrap settings allowed by the
-// deployment contract. Every mutable operating setting lives in PostgreSQL.
+// Config exposes the four required bootstrap settings and optional shutdown
+// drain setting allowed by the deployment contract. Mutable operating policies
+// live in PostgreSQL.
 type Config struct {
 	PostgresDSN            string
 	BootstrapAdmin         string
